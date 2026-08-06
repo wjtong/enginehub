@@ -22,7 +22,10 @@ function builtinModel(id: string): PiModel | undefined {
   return undefined;
 }
 
-export function getBaseModel(id: string, fallback?: { name: string; provider: string }): PiModel {
+export function getBaseModel(
+  id: string,
+  fallback?: { name: string; provider: string; api?: "openai-completions" | "anthropic-messages" },
+): PiModel {
   const builtin = builtinModel(id);
   if (builtin) return builtin;
   const clone = CLONE_TEMPLATES[id];
@@ -34,11 +37,18 @@ export function getBaseModel(id: string, fallback?: { name: string; provider: st
     const template = getModel("openrouter", "openrouter/auto" as Parameters<typeof getModel>[1]) as PiModel | undefined;
     if (template) return cloneModel(template, id, fallback.name);
   }
+  if (fallback?.api) {
+    const template =
+      fallback.api === "anthropic-messages"
+        ? builtinModel("claude-opus-4-8")
+        : (getModel("openrouter", "openrouter/auto" as Parameters<typeof getModel>[1]) as PiModel | undefined);
+    if (template) return cloneModel(template, id, fallback.name, { provider: fallback.provider, api: fallback.api });
+  }
   throw new Error(`Unsupported model: ${id}`);
 }
 
-function cloneModel(model: PiModel, id: string, name: string): PiModel {
-  return { ...structuredClone(model), id, name };
+function cloneModel(model: PiModel, id: string, name: string, overrides: Partial<PiModel> = {}): PiModel {
+  return { ...structuredClone(model), ...overrides, id, name };
 }
 
 const fastModeByScope = new Map<string, Set<string>>();

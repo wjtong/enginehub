@@ -96,6 +96,29 @@ test("runtime options preserve a fetched OpenRouter model as the selected web tu
   assert.equal(defaultModelValue(), "pi:anthropic/claude-sonnet-4.5");
 });
 
+test("runtime options preserve a custom provider model as the selected web turn model", () => {
+  applyRuntimeOptions(
+    null,
+    ["pi"],
+    { pi: ["custom-chat", "custom-anthropic"] },
+    { harnessId: "pi", modelId: "custom-chat" },
+    {
+      "custom-chat": { name: "Custom Chat", provider: "custom", api: "openai-completions" },
+      "custom-anthropic": { name: "Custom Anthropic", provider: "custom", api: "anthropic-messages" },
+    },
+  );
+  const options = getModelOptions();
+  const option = options[0]!;
+  const anthropicOption = options[1]!;
+  assert.equal(option.value, "pi:custom-chat");
+  assert.equal(option.model.id, "custom-chat");
+  assert.equal(option.model.provider, "custom");
+  assert.equal(option.model.api, "openai-completions");
+  assert.equal(anthropicOption.model.provider, "custom");
+  assert.equal(anthropicOption.model.api, "anthropic-messages");
+  assert.equal(defaultModelValue(), "pi:custom-chat");
+});
+
 test("runtime options hide retired persisted model ids", () => {
   applyRuntimeOptions(
     null,

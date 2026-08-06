@@ -74,7 +74,9 @@ test("a registered custom model is serviceable regardless of built-in key availa
 
 test("catalog lists custom models; clearing the registry removes them", () => {
   setCustomProviders([GATEWAY]);
-  assert.deepEqual(customModelCatalog(), [{ id: "acme-large", name: "Acme Large", provider: "acme-gateway" }]);
+  assert.deepEqual(customModelCatalog(), [
+    { id: "acme-large", name: "Acme Large", provider: "acme-gateway", api: "openai-completions" },
+  ]);
   setCustomProviders([]);
   assert.equal(isCustomModelId("acme-large"), false);
   assert.equal(resolveModel("acme-large"), undefined);
@@ -139,6 +141,7 @@ test("registered models surface in the catalog and vanish on unregister", () => 
   const entry = catalog.find((m) => m.id === "deepseek-chat");
   assert.ok(entry, "custom model appears in the catalog");
   assert.equal(entry!.provider, "deepseek");
+  assert.equal(entry!.api, "openai-completions");
   setCustomProviders([]);
   assert.ok(!builtInModelCatalog().some((m) => m.id === "deepseek-chat"));
 });
