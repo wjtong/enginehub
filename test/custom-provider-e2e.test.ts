@@ -161,6 +161,17 @@ test("QA: full custom-provider lifecycle against a live fake upstream", async ()
       provider: "qa",
       api: "openai-completions",
     });
+    built.config.setApprovedHarnesses(["pi"]);
+    const accepted = await built.app.turn({
+      surface: "web",
+      actor: { externalId: "alice" },
+      conversation: { kind: "dm", threadRef: "web:alice:qa-custom-provider" },
+      text: "hello",
+      harness: "pi",
+      model: "qa-chat",
+      async: true,
+    });
+    assert.equal(accepted.status, "queued", JSON.stringify(accepted));
 
     // 6. REAL model call through QM's pi path → fake upstream answers
     const reply = await oneShot(

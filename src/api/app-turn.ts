@@ -173,7 +173,7 @@ export function createTurnMethods(
         let enabledWebuiModels: string[] | null = null;
         if (configuredWebuiModels?.length) {
           enabledWebuiModels = [...new Set([...configuredWebuiModels, orgRuntime.modelId])];
-        } else if (providers?.openrouter) {
+        } else {
           enabledWebuiModels = [
             ...new Set([
               ...selectableCatalogForHarness(
