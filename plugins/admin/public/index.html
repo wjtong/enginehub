@@ -5585,7 +5585,11 @@
           "hidden",
           view === "onboarding" || view === "governance" || view === "connectors",
         );
-        if (view === "onboarding") return void loadOnboarding();
+        if (view === "onboarding") {
+          void loadOnboarding();
+          void loadCustomProviders();
+          return;
+        }
         if (view === "governance") return void loadScope();
         if (view === "connectors") return void loadConnectors();
         if (view === "user") return void showUserDetail(st.principal);
@@ -6044,6 +6048,7 @@
         if (view === "history" && urlToState().session) return;
         if (view === "onboarding") {
           loadOnboarding();
+          loadCustomProviders();
           return;
         }
         if (view === "slack") {
