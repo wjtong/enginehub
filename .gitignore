@@ -21,3 +21,5 @@ __pycache__/
 docs/master.html
 
 .context/
+
+.ops-private/

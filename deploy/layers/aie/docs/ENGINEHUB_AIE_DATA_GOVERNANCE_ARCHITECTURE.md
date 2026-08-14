@@ -174,6 +174,15 @@ AIE 当前有以下值得保留的领域能力：
 
 任何 AIE 功能实现开始前，Phase 0 仍必须先 fetch 两个 remote，重新比较 `origin/main` 与 `upstream/main`，并审计 `aie` 相对 `origin/main` 的 Core tree：通用修复提交 upstream，组织专属内容迁入 `deploy/layers/<org>/`，再同步私有 `main`。不得依赖本文记录的历史提交数量判断边界是否干净。
 
+### 4.6 目标环境约束
+
+本仓库是公开仓库，具体环境清单、集群标识、容量、版本和运维投递坐标一律留在不入库的 ops overlay，不写入本文。以下只记录会改变通用设计的约束，实施前须对实际目标环境重新核实：
+
+- 不得假设可以复用组织现有的 Kubernetes 集群。既有集群可能在版本、集群规格或租户隔离上不满足 AD-13/AD-14/AD-15，且跨越过多小版本时不存在原地升级路径。M0a 与 M0b 的集群按新建规划。
+- 不得假设 ACK API Server 可从开发者机器或 CI 直连。托管集群可以只暴露内网端点，此时投递必须经由 VPC 内的带外通道执行。M0a 的 Kubernetes hosting target 必须支持这种形态，或在文档中明确要求开放端点。
+- 不得假设镜像仓库与集群同地域，也不得假设可用的是企业版 ACR。镜像与 secret 契约按跨地域拉取和个人版能力下限设计。
+- 共享多租户集群上不存在特权容器的安全部署方式：逃逸后果波及同节点其它租户。这与 AD-14 的分集群、分 VPC 要求一致，任何"先在现有集群上用特权 Sandbox 过渡"的方案都不成立。
+
 ## 5. 目标和非目标
 
 ### 5.1 目标
@@ -436,7 +445,7 @@ deploy/layers/aie/
 
 ### 7.1 阿里云总体拓扑
 
-生产强制采用双集群、双 VPC 信任边界。可信业务与治理平面部署在主 ACK Managed Pro 集群；不可信工具执行固定部署在独立 Sandbox ACK Managed Pro 集群。Sandbox 集群通过 ACK Virtual Node 调度 ACS Agent Sandbox compute，每个任务获得独立 MicroVM。ACK Virtual Node、Agent Sandbox controller、manager、identity、SandboxGateway 和 egress 组件只安装在 Sandbox 集群，不能安装到主 ACK 后仍宣称完成了分集群隔离。
+生产强制采用双集群、双 VPC 信任边界。两个集群都按新建规划，不复用既有集群（见 4.6）。可信业务与治理平面部署在主 ACK Managed Pro 集群；不可信工具执行固定部署在独立 Sandbox ACK Managed Pro 集群。Sandbox 集群通过 ACK Virtual Node 调度 ACS Agent Sandbox compute，每个任务获得独立 MicroVM。ACK Virtual Node、Agent Sandbox controller、manager、identity、SandboxGateway 和 egress 组件只安装在 Sandbox 集群，不能安装到主 ACK 后仍宣称完成了分集群隔离。
 
 ```mermaid
 flowchart LR
@@ -1219,7 +1228,7 @@ M0 拆分为两个并行推进、独立验收的子里程碑。M0a 是治理主�
 
 - upstream 实现 capability-aware Agent/viewer extension gateway、版本化 manifest 和 `/v1/apis` 发现。
 - upstream 实现所有 Scope 类型的实时成员资格/revision 契约、request-bound assertion、durable replay 防护、pre-model egress hook 和 pre-persist hook。
-- upstream 实现 plugin 退出全局 `CORE_SIGNING_SECRET`、extension 专用非对称身份和通用 Kubernetes hosting target。
+- upstream 实现 plugin 退出全局 `CORE_SIGNING_SECRET`、extension 专用非对称身份和通用 Kubernetes hosting target；该 target 不得假设 CLI 能直连 API Server，需支持 4.6 节所述的私有端点带外投递，或在文档中明确要求开放端点。
 - upstream 实现 OSS/S3-compatible object store contract 与 Alibaba KMS secret source，替换 durable file/blob 与 secret 的 local/AWS-only 生产假设。
 - ACK layer 提供主 ACK（可信平面）Helm/IaC、最小 RRSA、KMS、ALB、SLS、ACR、namespace、ServiceAccount 和多可用区参数；首发显式禁用尚无 KubernetesDeployProvider 的 Apps 发布。
 - 合并并发布 upstream 版本，私有 fork 同步该版本；确认 organization slug 和 ACK Region/VPC 后，用支持 `--target kubernetes` 的 CLI 初始化 layer。
@@ -1456,6 +1465,8 @@ M0 拆分为两个并行推进、独立验收的子里程碑。M0a 是治理主�
 | 正式 organization layer slug | 暂用 `aie`                                    | 初始化 deployment layer 前 |
 | `aie` Core 偏差              | Phase 0 先回 upstream 或移入 layer            | 任何实现前                 |
 | ACK Region/VPC/账号边界      | 主 ACK 与 Sandbox 强制分 VPC；优先分账号      | M0 IaC 前                  |
+| 既有集群复用                 | 按不可复用规划，两个集群均新建（见 4.6）      | M0a IaC 前                 |
+| 私有 API Server 投递路径     | K8s target 需支持带外投递或要求开放端点       | M0a Kubernetes target 设计时 |
 | ACS Agent Sandbox 上线准入   | T-90 go/no-go；失败只延迟 M0b/Sandbox，签字材料写明产品代价 | 生产上线前 90 天           |
 | Agent Sandbox 集群形态       | 固定独立 ACK + ACK Virtual Node + ACS compute | M0 IaC 前                  |
 | Sandbox 唯一生产后端         | `acs-agent-sandbox`，禁止所有 fallback        | M0 PoC 前                  |
