@@ -33,16 +33,16 @@ export function getBaseModel(
     const template = builtinModel(clone.template);
     if (template) return cloneModel(template, id, clone.name);
   }
-  if (fallback?.provider === "openrouter") {
-    const template = getModel("openrouter", "openrouter/auto" as Parameters<typeof getModel>[1]) as PiModel | undefined;
-    if (template) return cloneModel(template, id, fallback.name);
-  }
   if (fallback?.api) {
     const template =
       fallback.api === "anthropic-messages"
         ? builtinModel("claude-opus-4-8")
         : (getModel("openrouter", "openrouter/auto" as Parameters<typeof getModel>[1]) as PiModel | undefined);
     if (template) return cloneModel(template, id, fallback.name, { provider: fallback.provider, api: fallback.api });
+  }
+  if (fallback) {
+    const template = getModel("openrouter", "openrouter/auto" as Parameters<typeof getModel>[1]) as PiModel | undefined;
+    if (template) return { ...cloneModel(template, id, fallback.name), provider: fallback.provider };
   }
   throw new Error(`Unsupported model: ${id}`);
 }

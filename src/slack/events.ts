@@ -27,7 +27,13 @@ export function registerSlackEvents(
     ids: BotIdentity;
     deduper: ReturnType<typeof createDeduper>;
     webUiPublicUrl?: string;
-    ensureHeader?: (client: SurfaceHeaderClient, channel: string, scopeId: string, kind: "dm" | "channel") => void;
+    ensureHeader?: (
+      client: SurfaceHeaderClient,
+      channel: string,
+      scopeId: string,
+      kind: "dm" | "channel",
+      ensureOpts?: { pinNew?: boolean },
+    ) => void;
   },
 ): void {
   const { handler, mirror, directory, ids, deduper } = deps;
@@ -184,7 +190,9 @@ export function registerSlackEvents(
         ...(deps.ensureHeader
           ? {
               ensureHeader: (channel: string) =>
-                deps.ensureHeader!(client as SurfaceHeaderClient, channel, `channel:${channel}`, "channel"),
+                deps.ensureHeader!(client as SurfaceHeaderClient, channel, `channel:${channel}`, "channel", {
+                  pinNew: true,
+                }),
             }
           : {}),
       });
@@ -192,6 +200,16 @@ export function registerSlackEvents(
       await forceDirectorySync(client);
     }
   });
+
+  for (const evt of ["channel_created", "channel_rename", "channel_unarchive"] as const) {
+    app.event(evt, async ({ event, body, client }: any) => {
+      const e = event as { channel?: { id?: string } | string; event_ts?: string };
+      const channel = typeof e.channel === "string" ? e.channel : e.channel?.id;
+      if (deduper.seen(dedupeKey({ event_id: (body as { event_id?: string })?.event_id, channel, ts: e.event_ts })))
+        return;
+      await forceDirectorySync(client);
+    });
+  }
 
   app.event("member_left_channel", async ({ event, body, client }: any) => {
     const e = event as { channel?: string; event_ts?: string };

@@ -2905,6 +2905,30 @@
         text-overflow: ellipsis;
         white-space: nowrap;
       }
+      .environment-notice {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 18px;
+        margin: 0 0 18px;
+        padding: 14px 16px;
+        border: 1px solid color-mix(in srgb, var(--warn) 42%, var(--border));
+        border-radius: 10px;
+        background: color-mix(in srgb, var(--warn) 8%, var(--surface));
+      }
+      .environment-notice strong,
+      .environment-notice p {
+        display: block;
+        margin: 0;
+      }
+      .environment-notice p {
+        margin-top: 3px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      .environment-notice button {
+        flex: none;
+      }
       .governance-overview {
         margin: 0 0 22px;
         padding: 18px 20px;
@@ -3987,6 +4011,13 @@
                 <span>Scope</span><strong id="governance-scope-label">Organization</strong>
               </div>
             </div>
+            <aside class="environment-notice hidden" id="environment-notice" role="status">
+              <div>
+                <strong id="environment-notice-title"></strong>
+                <p id="environment-notice-detail"></p>
+              </div>
+              <button type="button" id="environment-notice-open">Open environment</button>
+            </aside>
             <section class="governance-overview" id="governance-overview" aria-labelledby="governance-overview-title">
               <div class="governance-overview-head">
                 <h2 id="governance-overview-title">Effective state</h2>
@@ -4306,6 +4337,33 @@
                   <div class="foot">
                     <button class="primary" data-save="org-ambient">Apply</button
                     ><span class="status" id="st-org-ambient"></span>
+                  </div>
+                </section>
+                <section class="card setting-row hidden" id="card-channel-header-pin-default">
+                  <div class="head">
+                    <h2>Channel pinned header</h2>
+                    <p>
+                      Org-wide, default off. When on, the agent posts and pins a small header message (naming the model
+                      in use) in every Slack channel it's in. Channels can still override it either way from their
+                      project page.
+                    </p>
+                  </div>
+                  <div class="body">
+                    <label class="setting-toggle">
+                      <input type="checkbox" id="channel-header-pin-default" />
+                      <span class="setting-switch" aria-hidden="true"></span>
+                      <span class="setting-copy"
+                        ><strong>Pin the header by default</strong
+                        ><small
+                          >Applies to channels without an explicit choice; flipping this updates existing channels
+                          within a moment.</small
+                        ></span
+                      >
+                    </label>
+                  </div>
+                  <div class="foot">
+                    <button class="primary" data-save="channel-header-pin-default">Apply</button
+                    ><span class="status" id="st-channel-header-pin-default"></span>
                   </div>
                 </section>
                 <div class="governance-group" id="governance-intelligence">
@@ -5721,6 +5779,7 @@
       });
 
       let scopeDir = null;
+      let environmentDir = [];
       let scopeDirNote = "Loading scopes…";
       async function loadScopeDirectory() {
         const r = await api("GET", "/api/scopes");
@@ -5732,6 +5791,7 @@
         }
         viewLoadedAt.history = Date.now();
         scopeDir = r.data.scopes || [];
+        environmentDir = r.data.environments || [];
 
         if (SCOPED.has(view) && !urlToState().session) {
           const memoryEditor = view === "memory" && !(orgWideView() && urlToState().mem !== "edit");
@@ -6249,6 +6309,19 @@
         );
       }
       window.addEventListener("scroll", syncGovernanceSectionNav, { passive: true });
+      function renderEnvironmentNotice(data) {
+        const notice = $("environment-notice");
+        const attachment = data?.environmentAttachment;
+        notice.classList.toggle("hidden", !attachment);
+        if (!attachment) return;
+        const name = attachment.environmentName || shortName(attachment.environmentId);
+        $("environment-notice-title").textContent = "Uses named environment " + name;
+        $("environment-notice-detail").textContent =
+          "Computer files and working memory resolve to this environment. Governance and conversation history remain scoped here.";
+        $("environment-notice-open").textContent = "Open " + name;
+        $("environment-notice-open").onclick = () =>
+          go({ view: "governance", scope: attachment.environmentId, session: null, page: 1 });
+      }
       let governanceReq = 0;
       async function loadScope() {
         const requestedScope = scope;
@@ -6264,6 +6337,7 @@
           );
           return;
         }
+        renderEnvironmentNotice(r.data);
         renderGovernanceOverview(r.data);
         syncGovernanceSectionNav();
         loadedCommandPolicyPresent = r.data.commandPolicy != null;
@@ -6321,6 +6395,9 @@
         const showInteractiveFastMode = scope.startsWith("org:") && "interactiveFastMode" in r.data;
         $("card-interactive-fast-mode").classList.toggle("hidden", !showInteractiveFastMode);
         if (showInteractiveFastMode) $("interactive-fast-mode").checked = r.data.interactiveFastMode === true;
+        const showHeaderPinDefault = scope.startsWith("org:") && "channelHeaderPinDefault" in r.data;
+        $("card-channel-header-pin-default").classList.toggle("hidden", !showHeaderPinDefault);
+        if (showHeaderPinDefault) $("channel-header-pin-default").checked = !!r.data.channelHeaderPinDefault;
 
         const opts = r.data.baseModelOptions || [];
         const dflt = r.data.baseModelDefault || "";
@@ -7942,6 +8019,7 @@
         "external-slack-participants": () => ({ on: $("external-slack-participants").checked }),
         "org-ambient": () => ({ on: $("org-ambient").checked }),
         "interactive-fast-mode": () => ({ on: $("interactive-fast-mode").checked }),
+        "channel-header-pin-default": () => ({ on: $("channel-header-pin-default").checked }),
         runtime: () => ({ harnessId: $("base-harness").value, modelId: $("base-model").value }),
         "approved-harnesses": () => ({
           ids: Array.from(document.querySelectorAll("#approved-harnesses-list input[type=checkbox]:checked")).map(
@@ -7974,6 +8052,7 @@
         "external-slack-participants": "st-external-slack-participants",
         "org-ambient": "st-org-ambient",
         "interactive-fast-mode": "st-interactive-fast-mode",
+        "channel-header-pin-default": "st-channel-header-pin-default",
         runtime: "st-runtime",
         "approved-harnesses": "st-approved-harnesses",
         "webui-models": "st-webui-models",
@@ -11456,6 +11535,21 @@
           actions: [sortControl],
         });
         const activityTime = (s) => (scopeSort === "human" ? s.lastConversationActivity || 0 : s.lastActivity || 0);
+        if (environmentDir.length) {
+          const environments = denseList(
+            environmentDir,
+            (environment) => ({
+              name: environment.name || shortName(environment.id),
+              preview: plural(environment.attachedScopes?.length || 0, "attached scope"),
+              href: stateToUrl({ view: "history", scope: environment.id, historyKind }),
+            }),
+            (environment) => selectScope(environment.id),
+            "No named environments.",
+          );
+          root.appendChild(
+            dataCard("Named environments", "Named computers and working memory that scopes can share.", environments),
+          );
+        }
         const t = denseList(
           activeRows,
           (s) => {
@@ -12003,7 +12097,7 @@
         const stats = document.createElement("div");
         stats.className = "context-stats";
         const latest = reqs[reqs.length - 1];
-        const latestSections = contextSections(latest.request, latest.transport);
+        const latestSections = contextSections(requestBody(latest), latest.transport);
         stats.append(metaChip((latest.model || "?") + " · " + fmtContextSize(latest, latestSections)));
         cacheMetaItems(turnCache).forEach((b) => stats.appendChild(b));
         stats.appendChild(rawJsonLink(reqs));
@@ -13871,6 +13965,9 @@
           "\n\n(auth + anthropic-version headers are added by the provider SDK below the capture point, so they aren't shown)"
         );
       }
+      function requestBody(q) {
+        return q && q.promptEnvelope != null ? q.promptEnvelope : q ? q.request : null;
+      }
       function contextSections(request, transport) {
         const req = request && typeof request === "object" ? request : {};
         const messages = Array.isArray(req.messages) ? req.messages : [];
@@ -13890,7 +13987,9 @@
           {
             key: "messages",
             label: "Messages",
-            note: messages.length + " message" + (messages.length === 1 ? "" : "s"),
+            note: messages.length
+              ? messages.length + " message" + (messages.length === 1 ? "" : "s")
+              : "not re-captured per step — the transcript is the record",
             text: messages.map(messageEntryText).join("\n\n"),
           },
           {
@@ -14056,8 +14155,8 @@
         a.className = "context-raw";
         let payload;
         if (requests.length === 1) {
-          payload = requests[0]?.request;
-          if (requests[0]?.transport) payload = { request: requests[0].request, transport: requests[0].transport };
+          payload = requestBody(requests[0]);
+          if (requests[0]?.transport) payload = { request: requestBody(requests[0]), transport: requests[0].transport };
         } else {
           payload = requests.map((q) => ({
             step: q.step,
@@ -14065,7 +14164,7 @@
             createdAt: q.createdAt,
             truncated: !!q.truncated,
             ...(q.transport ? { transport: q.transport } : {}),
-            request: q.request,
+            request: requestBody(q),
           }));
         }
         a.href = "#";
@@ -14082,7 +14181,7 @@
         return a;
       }
       function renderContextRequest(q, i, totalRequests) {
-        const sections = contextSections(q.request, q.transport);
+        const sections = contextSections(requestBody(q), q.transport);
         const wrap = document.createElement("div");
         wrap.className = "context-request";
         const selection = document.createElement("div");
@@ -14124,7 +14223,7 @@
         role.className = "role";
         role.textContent = "sent to model";
         const latest = requests[requests.length - 1] || { request: {} };
-        const latestSections = opts.latestSections || contextSections(latest.request, latest.transport);
+        const latestSections = opts.latestSections || contextSections(requestBody(latest), latest.transport);
         const sync = () => {
           const open = !block.classList.contains("collapsed");
           tog.textContent = open ? "▾" : "▸";

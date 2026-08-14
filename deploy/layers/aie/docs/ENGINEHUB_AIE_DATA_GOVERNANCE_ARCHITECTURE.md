@@ -3,7 +3,7 @@
 - 状态：已版本化的设计提案，尚未进入功能实现或初始化 deployment layer
 - 目标分支：`aie`
 - 基线日期：2026-08-14
-- EngineHub 基线：`5ac6f94c3537f9ac29e8e363c0bb4614da47fd32`
+- EngineHub 基线：`d752485d44c26724e6c4e05a7a9acb6331db3455`
 - AIE 基线：`317652a20250b29a7c57ad5bd2408c367fb83876`
 - 来源系统：`/Users/wtong/git/gongs-claw`
 - 目标系统：`/Users/wtong/git/enginehub`
@@ -118,7 +118,7 @@ EngineHub 当前已经具备：
 - Agent turn、会话 Task 和命令审批不等价于 ETL 工作流或长期数据访问审批。
 - 当前 Core 的通用 Scope 校验在部分 Scope 类型上仍可能只验证格式或静态可达性；治理查询不得把它描述或使用为完整实时撤权能力。
 - qm hosting target 当前只有 Docker、Fly 和 AWS，没有 Kubernetes/ACK deployment backend。
-- SandboxBackend 当前只有 `local/sprites/aws`；只有 Sprites 实现强制域名 egress，local 与 AWS profile 不能作为 ACK 生产隔离保证。
+- SandboxBackend 当前有 `local/sprites/aws/smolmachines`；只有配置 egress proxy 的 Sprites profile 声明强制域名 egress，local、AWS 与 Smolmachines profile 都不能作为 ACK 生产隔离保证。
 - Apps deployment 使用另一套 DeployProvider，当前也没有 Kubernetes 实现。
 - Pi 与模型调用在 Core 进程，Sandbox 只承载命令、文件和进程会话；不能通过“把 Core Pod 调度到 ACS compute”替代真正 per-task SandboxProvider。
 
@@ -166,9 +166,9 @@ AIE 当前有以下值得保留的领域能力：
 
 ### 4.5 私有 fork 基线偏差
 
-当前 checkout 是私有 fork。设计基线时，私有 `main` 与 `aie` 同在 `5ac6f94`，但 `upstream/main` 在 `d719f54`；私有 `main` 还包含 7 个额外提交和 14 个 Core 文件差异，主要是 custom provider 支持。这与“`main` 只同步 upstream、私有功能只放 deployment layer”的目标边界不一致。
+当前 checkout 是私有 fork。本次设计基线已将私有 `origin/main` 的 `d752485` 合入 `aie`；custom provider 主干能力已经进入同步下来的通用代码线，但 `aie` 仍保留协议感知、模型准入和 onboarding 刷新等少量 Core 差异，旧的固定提交数和文件数偏差结论不再成立。
 
-任何 AIE 功能实现开始前，Phase 0 必须先审计这些差异：通用修复提交 upstream，组织专属内容迁入 `deploy/layers/<org>/`，再同步私有 `main`。在该偏差消除前，不把当前 `main` 当作可持续的 upstream 镜像。
+任何 AIE 功能实现开始前，Phase 0 仍必须先 fetch 两个 remote，重新比较 `origin/main` 与 `upstream/main`，并审计 `aie` 相对 `origin/main` 的 Core tree：通用修复提交 upstream，组织专属内容迁入 `deploy/layers/<org>/`，再同步私有 `main`。不得依赖本文记录的历史提交数量判断边界是否干净。
 
 ## 5. 目标和非目标
 
@@ -520,7 +520,7 @@ M0 新增通用 remote contract、`AliyunAgentSandboxProvider` 和 broker，不�
 - Provision 完成后读取并验证 runtime、Pod UID、image digest、ServiceAccount、网络策略、资源限制和 generation；configuration evidence 不一致即销毁并拒绝，不把普通 MicroVM 验证描述为密码学 remote attestation。
 - 生产配置只允许 `acs-agent-sandbox` 一个 provider 路由值。Broker、Data Gateway、ACK Virtual Node、controller、manager、SandboxGateway、traffic policy 或 runtime identity 健康检查失败时拒绝 provision/exec，不尝试任何其他 backend；本地 Docker 仅用于开发测试，不能出现在生产配置。
 
-当前 Core 只支持 `sprites/aws/local` SandboxBackend，CLI 只支持 `docker/fly/aws` hosting target，Apps DeployProvider 只覆盖现有后端；WorkspaceStore 只有本地实现，Blob/Object 只有 local/S3 路径，secret source 只有 env/AWS Secrets Manager。ACK 生产至少需要分别解决 hosting、ACS Sandbox/daemon、Apps、durable WorkspaceStore、OSS/object storage 和 Alibaba KMS secret source，不能把“增加 Helm chart”当作完成 ACK 支持。OSS 可以先验证 S3-compatible endpoint，也可以实现 native provider，但兼容性、并发和错误语义必须有契约测试；Apps 在其 KubernetesDeployProvider 完成前保持禁用。
+当前 Core 只支持 `sprites/aws/local/smolmachines` SandboxBackend，CLI 只支持 `docker/fly/aws` hosting target，Apps DeployProvider 只覆盖现有后端；WorkspaceStore 只有本地实现，Blob/Object 只有 local/S3 路径，secret source 只有 env/AWS Secrets Manager。ACK 生产至少需要分别解决 hosting、ACS Sandbox/daemon、Apps、durable WorkspaceStore、OSS/object storage 和 Alibaba KMS secret source，不能把“增加 Helm chart”当作完成 ACK 支持。OSS 可以先验证 S3-compatible endpoint，也可以实现 native provider，但兼容性、并发和错误语义必须有契约测试；Apps 在其 KubernetesDeployProvider 完成前保持禁用。
 
 ### 7.4 Sandbox 类型与数据流
 
@@ -1401,7 +1401,7 @@ Decision 至少记录：
 | 风险或决策                   | 当前建议                                      | 确认时点                   |
 | ---------------------------- | --------------------------------------------- | -------------------------- |
 | 正式 organization layer slug | 暂用 `aie`                                    | 初始化 deployment layer 前 |
-| 私有 `main` Core 偏差        | Phase 0 先回 upstream 或移入 layer            | 任何实现前                 |
+| `aie` Core 偏差              | Phase 0 先回 upstream 或移入 layer            | 任何实现前                 |
 | ACK Region/VPC/账号边界      | 主 ACK 与 Sandbox 强制分 VPC；优先分账号      | M0 IaC 前                  |
 | ACS Agent Sandbox 上线准入   | T-90 执行 go/no-go；失败则延迟 Sandbox 上线   | 生产上线前 90 天           |
 | Agent Sandbox 集群形态       | 固定独立 ACK + ACK Virtual Node + ACS compute | M0 IaC 前                  |
@@ -1448,7 +1448,7 @@ Decision 至少记录：
 
 ### M0：平台基础
 
-- 完成 Phase 0 的私有 `main` Core 偏差处置。
+- 完成 Phase 0 的 `aie` Core 偏差处置。
 - upstream 实现并合并 extension manifest、Agent/viewer gateway、实时 Scope 撤权、replay protection、plugin secret opt-out、pre-model/pre-persist hook、Kubernetes hosting target、Kubernetes/remote SandboxProvider 和 Sandbox Tool Gateway。
 - upstream 补齐强类型 Sandbox DTO、独立 control/data assertion、Claim 状态机/operation receipt、ACS-only router 门禁、capability matrix、显式 egress mode、无 local-path 的 ACK durable WorkspaceStore、OSS/object store 和 Alibaba KMS secret source。
 - 发布 qm 版本并同步私有 fork。
@@ -1481,6 +1481,7 @@ EngineHub：
 - `src/sandbox/local-sandbox.ts`
 - `src/sandbox/sprites-sandbox.ts`
 - `src/sandbox/aws-sandbox.ts`
+- `src/sandbox/smolmachines-sandbox.ts`
 - `src/workspace/workspace-store.ts`
 - `src/resolution/egress-policy.ts`
 - `src/egress-authz-main.ts`

@@ -25,7 +25,7 @@ import type { GapPhase, LeaseAttempt, SessionStore } from "../sessions/session-s
 import { isOverheardEntry } from "../sessions/session-store.ts";
 import { supportsProcessSessions, supportsScopeProfile } from "../sandbox/sandbox.ts";
 import { createBackgroundBroker } from "../connectors/background-exec-broker.ts";
-import { createMonitorBroker } from "../monitors/monitor-broker.ts";
+import { createMonitorBroker, readBackgroundOutputTail } from "../monitors/monitor-broker.ts";
 import { isPollSurface, isSilentPollReply } from "../triggers/run-trigger.ts";
 import { envKey } from "../credentials/connector-token.ts";
 import { renderKeychainManifest, type MaterializedEnvCred } from "../credentials/keychain.ts";
@@ -71,7 +71,9 @@ import {
   renderPendingOnboardingPrompt,
 } from "../onboarding/onboarding.ts";
 import { createToolContext, NeedsApproval, CommandDenied } from "../tools/primitives.ts";
-import type { BrokeredLayerTool } from "../deployment/load-layer.ts";
+import { evaluateCommandWithLayer } from "../policy/command-policy.ts";
+import { createSecretValueMasker } from "../security/secret-masking.ts";
+import { shq } from "../util/shell.ts";
 import type { FileArtifact } from "../files/file-artifact-store.ts";
 import { filterHistoryForAudience, principalEntitledToScope } from "../resolution/context-filter.ts";
 import {
@@ -125,7 +127,7 @@ import { sleep } from "../util/async.ts";
 import { hashId } from "../util/crypto.ts";
 import { randomUUID } from "node:crypto";
 import { LRUCache } from "lru-cache";
-import type { SkillResolution } from "../skills/skill-store.ts";
+import type { SkillResolution, GrantedSkillRef } from "../skills/skill-store.ts";
 import type { Orchestrator, OrchestratorDeps, OrchestratorInput } from "./orchestrator/types.ts";
 import { resolveModel } from "../model/pi-models.ts";
 import {
@@ -148,6 +150,7 @@ import {
   currentTimeBlock,
   deliveryMenu,
   renderConversationRoster,
+  renderProjectHomeChannel,
   renderReachRoster,
   renderStandingObligations,
 } from "./orchestrator/prompt-blocks.ts";
@@ -511,7 +514,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         try {
           await deps.sessions.recordLlmRequest(screenSession.id, { ...rec, scopeLabel: scopeId });
         } catch (err) {
-          console.error("[orchestrator] failed to persist security screen request snapshot:", err);
+          console.error("[orchestrator] failed to persist security screen request snapshot:", errMessage(err));
         }
       };
       let screenedOverheard: OverheardEntryPayload[] = [];
@@ -760,6 +763,17 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           ? { ...(useMemory && memoryPolicy.capture !== "off" ? { write: memoryScopeId } : {}), read: recallScopes }
           : undefined;
       const skillScopes = visibleSkillScopes(resolution, scopeId);
+      const grantedSkills: GrantedSkillRef[] = (
+        await deps.acl
+          .sharedOfKindForAudience(
+            "skill",
+            conversation.audience,
+            scopeId,
+            resolution.orgScopeId,
+            principalEntitledToScope,
+          )
+          .catch(swallowAs("orchestrator: skill grants for audience", []))
+      ).map((g) => ({ id: parseRef(g.ref).id, ownerScopeId: g.ownerScopeId }));
       const recalledSections: string[] = [];
       let recallMs = 0;
       for (const recallScope of recallScopes) {
@@ -833,7 +847,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           )
         : [];
       const visibleSkillsForTurn = async (): Promise<SkillResolution[]> =>
-        filterConnectorSkills((await deps.skills?.visibleFor(skillScopes)) ?? [], configuredProviders);
+        filterConnectorSkills((await deps.skills?.visibleFor(skillScopes, grantedSkills)) ?? [], configuredProviders);
       const visibleSkills = await visibleSkillsForTurn();
       const transferId = turnFileId(input.runId, input.attempt);
       const turnSessionDir = `${TURN_FILES_DIR}/${hashId([conversation.threadRef], 24)}`;
@@ -859,6 +873,13 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       if (visibleSkills.length) systemPrompt += `\n\n${skillsIndex(visibleSkills)}`;
       const gatewayBlock = renderGatewayContext(input.surface, input.gatewayContext);
       if (gatewayBlock) systemPrompt += `\n\n${gatewayBlock}`;
+      const homeChannel =
+        conversation.kind === "group" && conversation.channelRef
+          ? await deps.managedGroups
+              ?.slackChannel?.(conversation.channelRef)
+              .catch(swallowAs("orchestrator: project home channel read", undefined))
+          : undefined;
+      if (homeChannel) systemPrompt += `\n\n${renderProjectHomeChannel(homeChannel.channelName)}`;
       systemPrompt += cronBlock;
       const sharedFilesBlock = sharedFilesSystemSection(resolution.grantedHandles);
       if (sharedFilesBlock) systemPrompt += `\n\n${sharedFilesBlock}`;
@@ -922,6 +943,15 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         commandUses.set(key, n - 1);
         return true;
       };
+      const authorizeCommand = (command: string, approvalKey?: string): boolean => {
+        let key = approvalKey ?? command;
+        if (approvalKey !== undefined && commandUses.has(approvalKey)) key = approvalKey;
+        else if (commandUses.has(command)) key = command;
+        const n = commandUses.get(key) ?? 0;
+        if (n <= 0) return false;
+        commandUses.set(key, n - 1);
+        return true;
+      };
       const brokeredTools = deps.brokeredTools ?? [];
       const cutoverModes = new Map<string, DeviceFlowCutoverMode>();
       for (const tool of brokeredTools) {
@@ -943,9 +973,15 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         input.origin.kind === "automation" &&
         input.origin.useOwnerKeychain === true;
       let ownerAuthAvailable = isolateOwnerKeychain;
+      if (
+        deps.sharedOwnerAuthIsolation === true &&
+        conversation.kind !== "dm" &&
+        brokeredTools.some((tool) => cutoverModeOf(tool.service) !== "legacy" && deps.layerBrokerFor?.(tool))
+      ) {
+        ownerAuthAvailable = true;
+      }
       const connectorEnv: Record<string, string> = {};
       const ownerAuthEnv: Record<string, string> = {};
-      const brokerVended = new Map<string, { tool: BrokeredLayerTool; env: Record<string, string> }>();
       const ownerEnvCredentialIds: string[] = [];
       const keychainInjected: MaterializedEnvCred[] = [];
       const credsStart = Date.now();
@@ -1069,6 +1105,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           ...(liveTurn ? { liveActor: true } : {}),
           ...(liveAuthorTurn ? { liveAuthor: true } : {}),
           ...(automatedTurn ? { triggered: true } : {}),
+          ...(!liveTurn && input.unattendedGrants ? { grants: input.unattendedGrants } : {}),
           threadRef: conversation.threadRef,
         };
         connectorEnv.AGENT_API_TOKEN = await mintCapabilityToken(
@@ -1159,17 +1196,9 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       if (!strictReadOnly && actor.type === "internal") {
         for (const tool of brokeredTools) {
           const mode = cutoverModeOf(tool.service);
+          if (mode !== "legacy") continue;
           const broker = deps.layerBrokerFor?.(tool);
           if (!broker) {
-            if (conversation.kind !== "dm" && mode !== "legacy") {
-              deps.credentialUsage?.record({
-                slug: tool.service,
-                host: "sts.amazonaws.com",
-                status: mode === "ephemeral_only" ? "ephemeral_failed_closed" : "legacy_fallback",
-                scopeLabel: scopeId,
-                principalId: actor.id,
-              });
-            }
             continue;
           }
           const aws = await broker
@@ -1184,19 +1213,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
                 AWS_DEFAULT_REGION: aws.region,
               }
             : null;
-          const isolateShared =
-            deps.sharedOwnerAuthIsolation === true && conversation.kind !== "dm" && mode !== "legacy";
-          if (awsEnv && isolateShared) {
-            brokerVended.set(tool.service, { tool, env: awsEnv });
-            ownerAuthAvailable = true;
-            deps.credentialUsage?.record({
-              slug: tool.service,
-              host: "sts.amazonaws.com",
-              status: "ephemeral_vended",
-              scopeLabel: scopeId,
-              principalId: actor.id,
-            });
-          } else if (awsEnv && (conversation.kind === "dm" || mode === "legacy")) {
+          if (awsEnv) {
             Object.assign(connectorEnv, awsEnv);
             deps.credentialUsage?.record({
               slug: tool.service,
@@ -1206,13 +1223,10 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               principalId: actor.id,
             });
           } else {
-            let status = "legacy_unavailable";
-            if (mode === "ephemeral_only") status = "ephemeral_failed_closed";
-            else if (mode === "prefer_ephemeral") status = "legacy_fallback";
             deps.credentialUsage?.record({
               slug: tool.service,
               host: "sts.amazonaws.com",
-              status,
+              status: "legacy_unavailable",
               scopeLabel: scopeId,
               principalId: actor.id,
             });
@@ -1230,7 +1244,16 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           swallow("gap-work emit", e);
         }
       };
-      const commandPolicy = resolution.commandPolicy;
+      const ephemeralOnlyDenyRules = brokeredTools
+        .filter((candidate) => cutoverModeOf(candidate.service) === "ephemeral_only")
+        .map((tool) => ({
+          pattern: `(^|[\\s;&|()])${tool.binary.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}($|[\\s;&|()])`,
+          decision: "deny" as const,
+          reason: `credential-bearing service ${tool.service} must be run with credential_exec`,
+        }));
+      const commandPolicy = ephemeralOnlyDenyRules.length
+        ? { ...resolution.commandPolicy, rules: [...ephemeralOnlyDenyRules, ...resolution.commandPolicy.rules] }
+        : resolution.commandPolicy;
       const layerCommandRules = [...(deps.deploymentLayer?.commandRules ?? [])];
       const reachAvailable = !!deps.reachExec && !!deps.directory && conversation.kind === "dm";
       const {
@@ -1238,6 +1261,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         scratchBox,
         ownerAuthBox,
         ownerAuthCommand,
+        scopedCommand,
         provision,
         provisionScratch,
         provisionOwnerAuth,
@@ -1263,14 +1287,12 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         ownerAuthAvailable,
         ownerAuthEnv,
         ownerEnvCredentialIds,
-        brokerVended,
         brokeredTools,
         quarantinedServices,
         brokerCutoverServices,
         cutoverModeOf,
         visibleSkills,
         visibleSkillsForTurn,
-        skillScopes,
         skillMaterializer,
         residentAuthConnectors,
         emitGapWork,
@@ -1569,11 +1591,30 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               })
             : undefined;
 
+        const readOutputTail = backgroundBroker
+          ? async (processId: string, maxBytes: number) => {
+              const handle = await provision();
+              return readBackgroundOutputTail(maxBytes, async (cursor, readMaxBytes) => {
+                const read = await backgroundBroker.poll(handle, processId, {
+                  sinceCursor: cursor,
+                  maxBytes: readMaxBytes,
+                  waitMs: 0,
+                });
+                return {
+                  chunks: read.chunks,
+                  cursor: read.cursor,
+                  ...(read.status.state === "exited" ? { exitCode: read.status.code } : {}),
+                };
+              });
+            }
+          : undefined;
+
         const monitorBroker =
           deps.monitors && deps.processes && supportsProcessSessions(deps.sandbox)
             ? createMonitorBroker({
                 store: deps.monitors,
                 registry: deps.processes,
+                readOutputTail: readOutputTail ?? (async () => ({ outputTail: "" })),
                 scopeId: memoryScopeId,
                 owner: actor.id,
                 ownerScopeId: scopeId,
@@ -1607,16 +1648,25 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               ownerId: actor.id,
             }).grantees
           : [];
+        // Files posted into a group/DM conversation (e.g. a project web session) get no
+        // per-member grants from defaultPublishAudience ("auto-share deferred"), which left
+        // other members unable to load them. Grant the conversation scope itself read access
+        // so everyone party to the conversation can fetch what was posted into it.
+        const fileOwnerScopeId = toScopeId("personal", actor.id);
+        const fileGrantees = [...fileAudience];
+        if ((conversation.kind === "group" || conversation.kind === "dm") && scopeId !== fileOwnerScopeId) {
+          fileGrantees.push(scopeId);
+        }
         const fileRegistration: ArtifactRegistration = {
           store: deps.files,
-          ownerScopeId: toScopeId("personal", actor.id),
+          ownerScopeId: fileOwnerScopeId,
           createdBy: actor.id,
           createdInScope: scopeId,
           seed: input.runId ?? `${session.id}:${Date.now()}`,
-          ...(fileAudience.length
+          ...(fileGrantees.length
             ? {
                 onRegistered: async ({ ownerScopeId, path }) => {
-                  for (const granteeScopeId of fileAudience) {
+                  for (const granteeScopeId of fileGrantees) {
                     await deps.acl.grant({
                       ownerScopeId,
                       ref: path,
@@ -1671,6 +1721,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           provisionScratch,
           ...(provisionOwnerAuth ? { provisionOwnerAuth } : {}),
           ...(ownerAuthCommand ? { ownerAuthCommand } : {}),
+          ...(scopedCommand ? { scopedCommand } : {}),
           ensureSkillTree,
           ...(reachAvailable
             ? {
@@ -1684,15 +1735,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           layers: resolution.layers,
           commandPolicy: () => commandPolicy,
           layerCommandRules: () => layerCommandRules,
-          authorizeCommand: (command: string, approvalKey?: string) => {
-            let key = approvalKey ?? command;
-            if (approvalKey !== undefined && commandUses.has(approvalKey)) key = approvalKey;
-            else if (commandUses.has(command)) key = command;
-            const n = commandUses.get(key) ?? 0;
-            if (n <= 0) return false;
-            commandUses.set(key, n - 1);
-            return true;
-          },
+          authorizeCommand,
           grantedHandles: resolution.grantedHandles,
           sharedMaterializeDir: turnSharedDir,
           workspace: deps.workspace,
@@ -1701,6 +1744,132 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           files: deps.files,
           auditLog: deps.auditLog,
           createdBy: actor.id,
+          ...(() => {
+            const available =
+              strictReadOnly || actor.type !== "internal"
+                ? []
+                : brokeredTools.filter(
+                    (tool) => cutoverModeOf(tool.service) !== "legacy" && deps.layerBrokerFor?.(tool),
+                  );
+            if (!available.length) return {};
+            return {
+              credentialExecServices: available.map(({ service, binary }) => ({ service, binary })),
+              credentialExec: async (
+                service: string,
+                args: string[],
+                opts?: { timeoutSeconds?: number; signal?: AbortSignal },
+              ) => {
+                const tool = available.find((candidate) => candidate.service === service);
+                if (!tool || cutoverModeOf(service) === "legacy") {
+                  throw new Error(`credential_exec service is unavailable: ${service}`);
+                }
+                const broker = deps.layerBrokerFor?.(tool);
+                if (!broker) throw new Error(`credential_exec broker is unavailable: ${service}`);
+                const composed = [shq(tool.binary), ...args.map(shq)].join(" ");
+                const gate = evaluateCommandWithLayer(
+                  composed,
+                  resolution.commandPolicy,
+                  deps.deploymentLayer?.commandRules ?? [],
+                );
+                if (gate.decision === "deny") throw new CommandDenied(composed, gate.reason ?? "denied by policy");
+                if (gate.decision === "require_approval" && !authorizeCommand(composed, gate.approvalKey)) {
+                  throw new NeedsApproval(
+                    composed,
+                    gate.reason ?? "requires approval",
+                    "approval",
+                    gate.matched,
+                    gate.approvalKey,
+                  );
+                }
+                let aws;
+                try {
+                  aws = await broker.credsForActor(actor.id);
+                } catch {
+                  deps.credentialUsage?.record({
+                    slug: service,
+                    host: "sts.amazonaws.com",
+                    status: cutoverModeOf(service) === "ephemeral_only" ? "ephemeral_failed_closed" : "legacy_fallback",
+                    scopeLabel: scopeId,
+                    principalId: actor.id,
+                  });
+                  throw new Error(`credential_exec could not vend credentials for ${service}`);
+                }
+                const awsEnv = {
+                  AWS_ACCESS_KEY_ID: aws.accessKeyId,
+                  AWS_SECRET_ACCESS_KEY: aws.secretAccessKey,
+                  AWS_SESSION_TOKEN: aws.sessionToken,
+                  AWS_REGION: aws.region,
+                  AWS_DEFAULT_REGION: aws.region,
+                };
+                const mask = createSecretValueMasker(awsEnv);
+                let handle;
+                let result: Awaited<ReturnType<typeof deps.sandbox.run>> | undefined;
+                let runError: unknown;
+                let cleanupError: unknown;
+                try {
+                  handle = await deps.sandbox.provision(
+                    resolution.layers.filter((layer) => layer.mode === "ro" && layer.mountPath === "global"),
+                    {
+                      env: awsEnv,
+                      egress: resolution.egress,
+                      ...(egressTokenForTurn ? { egressToken: egressTokenForTurn } : {}),
+                      scratch: { key: `credential-exec:${session.id}:${randomUUID()}` },
+                      routeScopeId: memoryScopeId,
+                    },
+                  );
+                  deps.credentialUsage?.record({
+                    slug: service,
+                    host: "sts.amazonaws.com",
+                    status: "ephemeral_vended",
+                    scopeLabel: scopeId,
+                    principalId: actor.id,
+                  });
+                  deps.auditLog.record({
+                    at: Date.now(),
+                    principalId: actor.id,
+                    action: "credential.materialize",
+                    resource: `${service} (ephemeral broker)`,
+                    scopeLabel: scopeId,
+                  });
+                  const requestedMs = opts?.timeoutSeconds == null ? deps.execTimeoutMs : opts.timeoutSeconds * 1000;
+                  const timeoutMs =
+                    requestedMs != null && deps.execTimeoutCeilingMs != null
+                      ? Math.min(requestedMs, deps.execTimeoutCeilingMs)
+                      : requestedMs;
+                  result = await deps.sandbox.run(
+                    handle,
+                    composed,
+                    timeoutMs !== undefined || opts?.signal
+                      ? {
+                          ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+                          ...(opts?.signal ? { signal: opts.signal } : {}),
+                        }
+                      : undefined,
+                  );
+                } catch (error) {
+                  runError = error;
+                } finally {
+                  if (handle) {
+                    let lastError: unknown;
+                    for (let attempt = 1; attempt <= 3; attempt++) {
+                      try {
+                        await deps.sandbox.teardown(handle, { destroy: true });
+                        lastError = undefined;
+                        break;
+                      } catch (error) {
+                        lastError = error;
+                        if (attempt < 3) await sleep(50 * attempt);
+                      }
+                    }
+                    cleanupError = lastError;
+                  }
+                }
+                if (cleanupError) throw new Error(`credential_exec cleanup failed for ${service}`);
+                if (runError || !result) throw new Error(`credential_exec failed while running ${service}`);
+                return { ...result, stdout: mask(result.stdout), stderr: mask(result.stderr) };
+              },
+            };
+          })(),
           ...(deps.publicWebUrl ? { publicWebUrl: deps.publicWebUrl } : {}),
           publishContext: {
             conversationKind: conversation.kind,
@@ -1715,6 +1884,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           memory: deps.memory,
           memoryScopeId,
           ...(memoryAccess ? { memoryAccess } : {}),
+          ...(deps.mcp ? { mcp: deps.mcp } : {}),
           sessionHistory: {
             search: async (q: string, limit?: number) =>
               searchSessionEntries(
@@ -2150,6 +2320,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             systemCacheBoundary: stableSystemBytes,
             history: continuation?.history ?? history,
             tools,
+            ...(tools.credentialExecServices ? { credentialExecServices: tools.credentialExecServices } : {}),
             ...(securityPolicy.inboundScreening === "external" &&
             (deps.securityScreener || deps.harness.models.screenSecurity)
               ? {
@@ -2282,7 +2453,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               try {
                 await deps.sessions.recordLlmRequest(session.id, { ...rec, scopeLabel: scopeId });
               } catch (err) {
-                console.error("[orchestrator] failed to persist LLM request snapshot:", err);
+                console.error("[orchestrator] failed to persist LLM request snapshot:", errMessage(err));
               }
             },
           });
@@ -2306,6 +2477,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
           !result.silent
         ) {
           const firstTapeWriteFailed = !!result.tapeWriteFailed;
+          const primaryStopped = !!result.stopped;
           // The model already wrote a reply as plain assistant text — deliver that text
           // directly instead of nudging it to re-post (a nudge here re-sends near-identical
           // text, which surfaces that render assistant entries show twice).
@@ -2378,6 +2550,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
               { history: nudgeHistory, ...(nudgeTape ? { tape: nudgeTape } : {}) },
             );
             if (firstTapeWriteFailed || result.tapeWriteFailed) result = { ...result, tapeWriteFailed: true };
+            if (primaryStopped && !result.stopped) result = { ...result, stopped: true };
             if (spine.surfaceOutboundCount === 0 && spine.staySilentReason === undefined && !result.silent) {
               const fallback = stripAckPrefix(result.reply ?? "", spineAckText).trim();
               if (fallback && defaultDestination && deps.deliveries) {
@@ -2516,7 +2689,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
             -1,
           );
           const preTurnCovered = tapeRows ? tapeRows.covered : false;
-          if (lastSeq >= 0 && preTurnCovered && !result.tapeWriteFailed && !compactionMirrorFailed) {
+          if (lastSeq >= 0 && preTurnCovered && !result.stopped && !result.tapeWriteFailed && !compactionMirrorFailed) {
             await withManagedRosterVersion(() =>
               deps.sessions.appendTape(lease, {
                 kind: "annotation",

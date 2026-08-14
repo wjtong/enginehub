@@ -96,8 +96,8 @@ test("a strip drop lands where a dragged pane header would, not merely at the en
 
 test("the pane body no longer offers a tab zone", () => {
   assert.doesNotMatch(layout, /"tab"/, "DropEdge must drop the zone that no longer exists");
-  const zones = fn(split, "zonesTpl");
-  assert.doesNotMatch(zones, /tab/i);
+  const zones = fn(split, "zonesTpl") + fn(split, "splitZonesTpl");
+  assert.doesNotMatch(zones, /"tab"/);
   assert.match(zones, /zoneTpl\("center", "Open here"/);
   for (const edge of ["left", "right", "top", "bottom"]) assert.match(zones, new RegExp(`zoneTpl\\("${edge}"`));
   assert.doesNotMatch(css, /\.zone-tab \{/);
@@ -169,4 +169,14 @@ test("a pane gives the conversation the same height chain the full-screen .main 
   assert.match(pane, /flex-direction: column;/, "…a column, like .main");
   assert.match(pane, /height: 100%;/, "…of definite height");
   assert.match(pane, /overflow: hidden;/, "…that clips instead of growing the pane");
+});
+
+test("adopting a remote layout normalizes the mirrored timestamp to the server record", () => {
+  const adopt = fn(split, "adoptRemoteSplit");
+  assert.match(adopt, /persistedUpdatedAt = at;/, "the in-memory watermark takes the server record's time");
+  assert.match(
+    adopt,
+    /JSON\.stringify\(\{ \.\.\.rec\.value, updatedAt: at \}\)/,
+    "the local mirror must carry the server-clamped timestamp, not the value's inner claim",
+  );
 });

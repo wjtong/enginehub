@@ -80,6 +80,7 @@ export interface Session {
   awaitingInput?: boolean;
   backgroundJobs?: number;
   watches?: number;
+  crons?: number;
 }
 
 export type EntryType =
@@ -217,6 +218,7 @@ export interface CronFireLogEntry {
 export interface Cron extends TriggerBase {
   schedule: CronSchedule;
   nextFireAt?: number;
+  lastAttemptAt?: number;
   title?: string;
   archived?: boolean;
   action?: string;
@@ -224,6 +226,7 @@ export interface Cron extends TriggerBase {
   createdAt: number;
   runAs?: "owner" | "scopeFloor" | "scopeShared";
   members?: Principal[];
+  unattendedGrants?: string[];
   fireLog?: CronFireLogEntry[];
 }
 
@@ -266,6 +269,7 @@ export interface SurfaceContextQuery {
   viewerToken?: string;
   file?: { ts: string; threadTs?: string; name?: string };
   openGroup?: { participants: string[] };
+  syncDirectory?: boolean;
 }
 
 export interface SurfaceContextResult {
@@ -386,6 +390,7 @@ export interface TurnRequest {
   entryTs?: string;
   gatewayContext?: GatewayContext;
   triggered?: boolean;
+  unattendedGrants?: string[];
   securityScreenData?: string;
   triggerDestination?: Destination;
   ownerKeychainUnion?: boolean;

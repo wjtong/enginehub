@@ -12,12 +12,12 @@ import {
   Brain,
   Check,
   ChevronRight,
+  Clock3,
   Copy,
   FileImage,
   FileText,
   Files,
   GitFork,
-  Hash,
   Maximize2,
   Paperclip,
   Pencil,
@@ -27,7 +27,6 @@ import {
   Rocket,
   ScrollText,
   Terminal,
-  Users,
   Wrench,
   type IconNode,
 } from "lucide";
@@ -52,7 +51,6 @@ import {
   makeOpenerStreamFn,
   makeRunResumeStreamFn,
   runApprovalTurn,
-  sharedContextLabel,
   TAIL_TURNS,
   type ApprovalDecision,
   type AssistantWork,
@@ -84,7 +82,9 @@ import {
   harnessSupportsFastMode,
 } from "./model-options";
 import { browserRenderableImage, formatBytes, icon, relTime } from "./ui";
-import { adminSessionLogUrl, appState, can, renderSidebarTop, syncUrlFromState } from "./shell";
+import { appState, renderSidebarTop, switchView, syncUrlFromState } from "./shell";
+import { contextsState, scopeTitle } from "./contexts";
+import { openProjectPage, scopeToolCount, sessionTopbarTpl, setScopedSession } from "./session-scope";
 import {
   addPendingSession,
   dropPendingSession,
@@ -381,6 +381,7 @@ export function createChatSurface(
         if (agent !== chatState.agent) return;
         adoptActiveSessionFromList(agent);
         await refreshTranscriptFromEntries(agent);
+        void followNextQueuedRun(agent, threadRef, normalStreamFn, onWork);
         if (wasUnsaved && chatState.sessionId) void settleNewSessionTitle(agent, threadRef);
       });
     });
@@ -629,6 +630,37 @@ export function createChatSurface(
     };
   }
 
+  async function followNextQueuedRun(
+    agent: Agent,
+    threadRef: string,
+    normalStreamFn: Agent["streamFn"],
+    onWork: (work: WorkBlock) => void,
+  ): Promise<void> {
+    let active: Awaited<ReturnType<typeof activeRunForThread>>;
+    try {
+      active = await activeRunForThread(threadRef);
+    } catch {
+      return;
+    }
+    if (agent !== chatState.agent || threadRef !== chatState.threadRef || agent.state.isStreaming) return;
+    const next = ctx.composer.queuedRunsFor(threadRef).find((r) => r.runId === active.runId);
+    ctx.composer.setQueuedRuns(threadRef, active.queued);
+    if (!active.runId || !active.run) return drawActiveChat(agent);
+    const recorded = (agent.state.messages.at(-1) as { role?: string } | undefined)?.role === "user";
+    if (!recorded && !next) return drawActiveChat(agent);
+    agent.streamFn = makeRunResumeStreamFn(active.runId, active.run, onWork, runSlot);
+    try {
+      await (recorded ? agent.continue() : agent.prompt(next!.text));
+    } catch (err) {
+      if (agent === chatState.agent) ctx.composer.state.error = errMessage(err, "Could not follow the queued message.");
+    } finally {
+      if (agent === chatState.agent) {
+        agent.streamFn = normalStreamFn;
+        await refreshTranscriptFromEntries(agent);
+      }
+    }
+  }
+
   async function resumeTrackedRun(
     agent: Agent,
     threadRef: string,
@@ -642,7 +674,15 @@ export function createChatSurface(
     } catch {
       return false;
     }
-    if (!activeRun || agent !== chatState.agent || appState.currentView !== "chats" || agent.state.isStreaming)
+    if (agent === chatState.agent && threadRef === chatState.threadRef)
+      ctx.composer.setQueuedRuns(threadRef, activeRun.queued);
+    if (
+      !activeRun.runId ||
+      !activeRun.run ||
+      agent !== chatState.agent ||
+      appState.currentView !== "chats" ||
+      agent.state.isStreaming
+    )
       return false;
     // Pull the transcript before attaching so the turn's triggering user message
     // (written by core, not by this tab) is on screen while the run streams.
@@ -1011,7 +1051,7 @@ export function createChatSurface(
     render(
       html`
         <div
-          class="custom-chat-shell ${ctx.composer.state.dragging ? "dragging" : ""}"
+          class="custom-chat-shell ${ctx.pane ? "in-pane" : ""} ${ctx.composer.state.dragging ? "dragging" : ""}"
           @dragenter=${(e: DragEvent) => ctx.composer.onDragEnter(e)}
           @dragover=${(e: DragEvent) => ctx.composer.onDragOver(e)}
           @dragleave=${(e: DragEvent) => ctx.composer.onDragLeave(e)}
@@ -1024,7 +1064,7 @@ export function createChatSurface(
                 </div>`
               : nothing
           }
-          ${contextBanner()}
+          ${glanceTier || ctx.pane ? nothing : sessionTopbar()}
           ${
             glanceTier
               ? paneGlance(agent, messages, glanceTier)
@@ -1086,16 +1126,42 @@ export function createChatSurface(
     return null;
   }
 
-  function contextBanner(): TemplateResult | typeof nothing {
-    const label = sharedContextLabel(chatState.scopeId, chatState.contextName);
-    if (!label) return nothing;
-    const glyph = chatState.scopeId?.startsWith("group:") ? Users : Hash;
-    return html`<div
-      class="context-banner"
-      title="This chat runs in the ${label} context — the agent works with that context's files and memory, separate from your personal context."
-    >
-      ${icon(glyph, 13)}<span><strong>${label}</strong> context</span>
-    </div>`;
+  function sessionTopbar(): TemplateResult {
+    const scope = chatState.scopeId;
+    const session = sessionsState.list.find((s) =>
+      chatState.sessionId
+        ? s.id === chatState.sessionId
+        : Boolean(chatState.threadRef) && s.threadRef === chatState.threadRef,
+    );
+    const title = session?.title?.trim() || "New chat";
+    const crumb = scope && !scope.startsWith("personal:") ? scopeTitle(scope, chatState.contextName) : null;
+    const forkedFrom =
+      chatState.forkSession && chatState.sessionId === chatState.forkSession.id
+        ? chatState.forkSession.forkedFrom
+        : undefined;
+    return sessionTopbarTpl({
+      crumb,
+      title,
+      fork: forkedFrom
+        ? {
+            title: forkedFrom.title?.trim() || "another conversation",
+            onClick: () => void forkOriginController.navigate(),
+          }
+        : null,
+      onCrumb: crumb && scope ? () => openProjectPage(scope) : null,
+      toolCount: scope ? (t) => scopeToolCount(t, scope, () => drawActiveChat()) : null,
+      onTool: (tool) => {
+        setScopedSession({
+          scopeId: scope ?? "",
+          sessionId: chatState.sessionId,
+          threadRef: chatState.threadRef,
+          title,
+          crumb,
+        });
+        if (scope && tool !== "memory") contextsState.selected = scope;
+        switchView(tool === "apps" ? "deploys" : tool);
+      },
+    });
   }
 
   function chatHeader(title: string | TemplateResult, detail: string, readOnly: boolean): TemplateResult {
@@ -1106,18 +1172,6 @@ export function createChatSurface(
           <div class="chat-subtitle">${readOnly ? "Read-only" : detail}</div>
         </div>
         <div class="topbar-actions">
-          ${
-            chatState.sessionId && can("admin")
-              ? html`<a
-                  class="icon-btn subtle"
-                  title="View session log (admin)"
-                  href=${adminSessionLogUrl(chatState.sessionId, chatState.scopeId ?? `org:${appState.me?.org ?? ""}`)}
-                  target="_blank"
-                  rel="noreferrer"
-                  >${icon(ScrollText, 17)}</a
-                >`
-              : nothing
-          }
           <button
             class="icon-btn subtle"
             title="Refresh conversations"
@@ -1374,7 +1428,13 @@ export function createChatSurface(
         );
       }
     }
-    if (parts.length === 0 && message.stopReason !== "error" && message.stopReason !== "aborted" && !hasWork)
+    if (
+      parts.length === 0 &&
+      message.stopReason !== "error" &&
+      message.stopReason !== "aborted" &&
+      !hasWork &&
+      !(message as AssistantWork).deliveredFiles?.length
+    )
       parts.push(typingRow());
     return parts;
   }
@@ -1538,7 +1598,7 @@ export function createChatSurface(
   async function refreshBackgroundDetail(): Promise<void> {
     const id = chatState.sessionId;
     if (!id) {
-      bgPanel.detail = { jobs: [], watches: [] };
+      bgPanel.detail = { jobs: [], watches: [], crons: [] };
       return;
     }
     const seq = ++bgPanel.fetchSeq;
@@ -1567,7 +1627,12 @@ export function createChatSurface(
       const row = sessionsState.list.find((r) =>
         chatState.sessionId ? r.id === chatState.sessionId : r.threadRef === chatState.threadRef,
       );
-      if (row && ((row.backgroundJobs ?? 0) !== d.jobs.length || (row.watches ?? 0) !== d.watches.length)) {
+      if (
+        row &&
+        ((row.backgroundJobs ?? 0) !== d.jobs.length ||
+          (row.watches ?? 0) !== d.watches.length ||
+          (row.crons ?? 0) !== d.crons.length)
+      ) {
         await refreshSessions({ silent: true });
         redrawBackgroundPanel();
       }
@@ -1620,7 +1685,7 @@ export function createChatSurface(
     const row = conversationBackground(sessionsState.list, chatState.sessionId, chatState.threadRef);
     const live =
       bgPanel.open && bgPanel.detail
-        ? backgroundLabel(bgPanel.detail.jobs.length, bgPanel.detail.watches.length)
+        ? backgroundLabel(bgPanel.detail.jobs.length, bgPanel.detail.watches.length, bgPanel.detail.crons.length)
         : null;
     const label = (live ?? row)?.label;
     if (!label && !bgPanel.open) return nothing;
@@ -1643,13 +1708,14 @@ export function createChatSurface(
 
   function backgroundPanelBody(): TemplateResult {
     const d = bgPanel.detail;
-    const empty = d && d.jobs.length === 0 && d.watches.length === 0;
+    const empty = d && d.jobs.length === 0 && d.watches.length === 0 && d.crons.length === 0;
     return html`<div class="bg-panel" role="region" aria-label="Background activity">
       ${bgPanel.error ? html`<div class="bg-panel-note">${bgPanel.error}</div>` : nothing}
       ${!d && bgPanel.loading ? html`<div class="bg-panel-note">Loading…</div>` : nothing}
       ${empty && !bgPanel.error ? html`<div class="bg-panel-note">Nothing running here anymore.</div>` : nothing}
       ${d ? d.jobs.map((j) => backgroundJobRow(j)) : nothing}
       ${d ? d.watches.map((w) => backgroundWatchRow(w)) : nothing}
+      ${d ? d.crons.map((c) => backgroundCronRow(c)) : nothing}
     </div>`;
   }
 
@@ -1677,6 +1743,26 @@ export function createChatSurface(
         ${open ? html`<pre class="bg-row-output">${out ? out.text || "(no output yet)" : "Loading output…"}</pre>` : nothing}
       </div>
     `;
+  }
+
+  function backgroundCronRow(c: SessionBackgroundView["crons"][number]): TemplateResult {
+    return html`
+      <div class="bg-row watch">
+        <div class="bg-row-head static">
+          ${icon(Clock3, 13)}
+          <span class="bg-row-cmd">Cron — ${c.title ?? "scheduled task"}</span>
+          <span class="bg-row-meta">${c.nextFireAt ? `next fire ${nextFireIn(c.nextFireAt)}` : "paused"}</span>
+        </div>
+      </div>
+    `;
+  }
+
+  function nextFireIn(at: number): string {
+    const mins = Math.round((at - Date.now()) / 60_000);
+    if (mins <= 0) return "due now";
+    if (mins < 60) return `in ${mins}m`;
+    if (mins < 1440) return `in ${Math.floor(mins / 60)}h ${String(mins % 60).padStart(2, "0")}m`;
+    return `in ${Math.floor(mins / 1440)}d`;
   }
 
   function backgroundWatchRow(w: SessionBackgroundView["watches"][number]): TemplateResult {
@@ -1775,9 +1861,20 @@ export function createChatSurface(
   }
 
   function workSeconds(work: WorkBlock): number {
-    if (work.startedAt == null) return 0;
-    const end = work.finishedAt ?? Date.now();
-    return Math.max(0, Math.round((end - work.startedAt) / 1000));
+    const times = work.activity.map((a) => a.createdAt).filter((t) => typeof t === "number" && t > 0);
+    const start = work.startedAt ?? (times.length ? Math.min(...times) : null);
+    if (start == null) return 0;
+    const live = work.status === "thinking" || work.status === "working";
+    let end = work.finishedAt;
+    if (end == null) {
+      if (live) end = Date.now();
+      else end = times.length ? Math.max(...times, start) : start;
+    }
+    return Math.max(0, Math.round((end - start) / 1000));
+  }
+
+  function workedLabel(prefix: string, secs: number): string {
+    return secs > 0 ? `${prefix} for ${secs}s` : prefix;
   }
 
   function usedToolsSuffix(work: WorkBlock): string {
@@ -1789,7 +1886,7 @@ export function createChatSurface(
     if (work.stale && (work.status === "thinking" || work.status === "working")) return "Interrupted — resuming…";
     if (work.status === "thinking") return "Thinking";
     const secs = workSeconds(work);
-    return work.status === "working" ? `Working for ${secs}s` : `Worked for ${secs}s`;
+    return work.status === "working" ? `Working for ${secs}s` : workedLabel("Worked", secs);
   }
 
   function workBlock(work: WorkBlock, isStreaming: boolean): TemplateResult {
@@ -1827,7 +1924,11 @@ export function createChatSurface(
     };
     for (const it of timeline) {
       const demoted = it.kind === "text" && (it.activity.payload as { demoted?: boolean } | null)?.demoted === true;
-      if (it.kind === "text" && !demoted) {
+      // Closing self-logs after a successful surface post are bookkeeping, not
+      // another piece of visible work. Keeping them in the transcript is useful
+      // for audit/replay, but rendering them creates an empty "Worked" fold.
+      if (demoted) continue;
+      if (it.kind === "text") {
         flushSeg();
         const text = ((it.activity.payload as { text?: string } | null)?.text ?? "").trim();
         if (text) parts.push(html`<div class="work-said">${markdown(text)}</div>`);
@@ -1836,14 +1937,15 @@ export function createChatSurface(
       }
     }
     flushSeg();
-    return html`<div class="work work-${work.status}">${parts}</div>`;
+    return parts.length ? html`<div class="work work-${work.status}">${parts}</div>` : html``;
   }
 
   function segmentSummaryLabel(items: TimelineItem[], work: WorkBlock): string {
     const tools = items.filter((it) => it.kind === "tool").length;
     if (tools > 0) return `${tools} tool call${tools === 1 ? "" : "s"}`;
     const secs = workSeconds(work);
-    return work.status === "failed" ? `Failed after ${secs}s` : `Worked for ${secs}s`;
+    if (work.status === "failed") return secs > 0 ? `Failed after ${secs}s` : "Failed";
+    return workedLabel("Worked", secs);
   }
 
   function approvalSummaryView(a: PendingApproval, expanded = false): TemplateResult {
@@ -2139,6 +2241,7 @@ export function createChatSurface(
     state: chatState,
     hasLiveRun: () => hasLiveRun(runSlot),
     signalLiveRun: (kind, text) => signalLiveRun(runSlot, kind, text),
+    currentTurnOptions,
     newChat,
     teardown: teardownActiveChat,
     resetChatState,
