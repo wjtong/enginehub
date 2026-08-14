@@ -67,6 +67,10 @@ flowchart LR
 | AD-15 | ACS Agent Sandbox 是唯一生产 Sandbox 后端             | 原生提供 Agent MicroVM、CRD、Warm Pool、休眠和弹性能力          |
 | AD-16 | Sandbox 不直接访问 Core、治理库、源库或云凭证         | 数据访问必须经过 Tool/Query/Artifact Broker                     |
 | AD-17 | 选择 ACS，但正式接受 Public Preview 风险仍是上线门槛  | 不设计第二生产后端；准入失败时停止 Sandbox 功能上线             |
+| AD-18 | M0 拆分为并行的 M0a 治理主干与 M0b Sandbox 平面       | 治理线不被 Public Preview Sandbox 依赖阻塞，两轴独立验收        |
+| AD-19 | 通用变更先以无 AIE 语境的 upstream RFC 取得方向认可   | upstream 接受度是关键路径，先暴露风险再投入实现                 |
+| AD-20 | 旧 AIE 已确认高危项在 Phase 0 显式签字处置            | 迁移长窗口内已知缺陷不得默认带病运行                            |
+| AD-21 | 成本与运维承载力评估是 M0a IaC 与 M0b 进入门槛        | 双集群拓扑最现实的失败模式是超出团队运维承载力                  |
 
 ## 3. 文档状态和术语
 
@@ -270,6 +274,7 @@ AIE 当前有以下值得保留的领域能力：
 - 服务端验证 `iss`、`aud`、`org_id`、时钟窗口、method、path/query、content type、body hash 和关键 header hash。
 - mutation 和数据查询要求 `Idempotency-Key`，并把它纳入 assertion 的规范化请求 hash。
 - 治理服务在 durable replay store 中原子消费 `jti`。Mutation 的相同 idempotency key 返回持久化的同一响应。查询 key 永久绑定同一 QueryExecution：短期 result buffer 仍存在时返回相同结果，清理后只返回稳定 completion metadata 和 `RESULT_EXPIRED`，绝不重新访问源端；其他重复使用拒绝。
+- replay 与幂等存储必须有界：`jti` 记录在 `exp` 加安全余量后清理，mutation 响应体超过 retention 后降级为稳定状态引用，查询 key 到 QueryExecution 的映射随 completion metadata 保留。清理策略属于 schema 设计的一部分，不得依赖无界表。
 - 高风险 mutation 要求 `live_actor=true`，必要时引用 durable approval。
 - assertion 只证明调用者上下文，不代替治理服务的资源授权。
 - Agent 查询必须带 Core 当时的模型 dispatch 上下文；它只用于 PDP 预判，结果真正进入模型前仍由 Core 按实际 dispatch 重新执行 egress 校验。
@@ -466,6 +471,8 @@ flowchart LR
 
 可信 ACK 集群和 Sandbox 集群必须使用不同 VPC、vSwitch、安全组、namespace、ServiceAccount、RAM Role、密钥域和审计索引；条件允许时进一步使用不同阿里云账号。两者之间只开放 Broker 到 Manager、EngineHub Sandbox Data Gateway 到原生 SandboxGateway、Sandbox egress 到 Tool Gateway/Egress Authz 所需的固定私网地址/端口，不建立任意东西向路由。Broker 只访问 Manager，Data Gateway 只访问 SandboxGateway，两者不得共用目的端身份。
 
+分集群的首要理由不是 MicroVM 计算隔离——ACS 已提供内核级隔离——而是把 Manager、SandboxGateway、identity、controller 等 Public Preview 级组件自身的控制面与凭证爆炸半径隔离在可信平面之外。因此不得以“已有 MicroVM 隔离”为由合并集群；只有这些组件通过与可信平面同级的安全评审后，合并才可另立 ADR 讨论。
+
 原生动态流量 JWT 由 `ack-agent-identity` 签发，Manager 只控制签发参数；启用时必须在创建请求设置 `security.agents.kruise.io/enable-jwt-auth: "true"`。`trafficAccessToken` 只从 Claim/create 响应取得，不写入 CR，SandboxGateway 使用 `E2B-Traffic-Access-Token` 校验并绑定 Sandbox ID/UID。该 token 官方默认有效期为 100 年且当前不会自动刷新，不能称为短期 EngineHub capability，也不能承担 actor/scope 授权。Broker 将其按 lease/generation 加密保存，Data Gateway 只有在独立的短期 EngineHub data assertion、live lease、revision、kill epoch 和幂等检查通过后，才在内存中兑换并注入原生请求；Core、Agent 和 Sandbox 永远看不到该 token。SandboxGateway 只负责原生 token 校验、路由和故障隔离，不理解 EngineHub actor/scope/lease。撤权时先由 Data Gateway 断流，再销毁对应 Sandbox ID/UID 并删除 token ciphertext。
 
 ACK Virtual Node 以及 controller、identity、Poseidon 等托管侧组件按 ACK add-on 的实际控制面落点运行，不能把它们误算成 ECS worker workload。Sandbox ACK 集群只保留承载当前版本实际非托管组件所需的少量受信 ECS 系统节点，例如 Manager、SandboxGateway 和 egress 组件；不运行 EngineHub 业务服务。用户 Sandbox 只能调度到 ACS compute，使用独立不可信 vSwitch 和企业级安全组。每次组件升级都必须重新读取最终 chart/Pod 落点，系统组件与用户 Sandbox 的 node selector、taint/toleration、namespace、ServiceAccount 和网络分区由 admission 强制，禁止相互漂移。
@@ -485,7 +492,7 @@ ACS Agent Sandbox 是唯一生产 SandboxProvider，不实现第二生产后端�
 | 身份     | EngineHub assertions + 原生 `trafficAccessToken`          |
 | 预热     | 只含签名基础镜像、无租户数据和凭证的 SandboxSet Warm Pool |
 
-截至 2026-08-14，阿里云仍将 Agent Sandbox 标为 Public Preview。本项目已经做出产品选型，但正式风险接受仍是上线门槛。上线前必须取得目标 Region/AZ 可用性、服务开通、组件兼容版本、配额、合同 SLA/支持、数据驻留、安全删除、补丁响应和容量成本的肯定结论；负面或未知的安全、驻留、删除和 SLA 结论不能被风险签字覆盖。Public Preview 只可在 CISO、Data Owner 和合规责任人书面接受后处理 admission 明确允许的低敏分类，并设置到期日与复审；PII、高敏或监管数据保持禁用。任一门槛不满足时，暂停 Sandbox 相关功能上线，不切换到任何其他 Sandbox backend。
+截至 2026-08-14，阿里云仍将 Agent Sandbox 标为 Public Preview。本项目已经做出产品选型，但正式风险接受仍是上线门槛。上线前必须取得目标 Region/AZ 可用性、服务开通、组件兼容版本、配额、合同 SLA/支持、数据驻留、安全删除、补丁响应和容量成本的肯定结论；负面或未知的安全、驻留、删除和 SLA 结论不能被风险签字覆盖。Public Preview 只可在 CISO、Data Owner 和合规责任人书面接受后处理 admission 明确允许的低敏分类，并设置到期日与复审；PII、高敏或监管数据保持禁用。任一门槛不满足时，暂停 Sandbox 相关功能上线，不切换到任何其他 Sandbox backend。go/no-go 与风险签字材料必须用产品语言写明推迟的具体代价：Sandbox 门槛失败时，Pi 的 command/file/process 工具、依赖 Sandbox 的 skill 执行和 `governed-data-compute` 全部不可用；chat、治理 UI/API、Catalog 与 UI/API 低敏查询不受影响。签字人必须清楚自己接受或推迟的产品能力范围。
 
 组件版本以目标地域 ACK 控制台与阿里云支持确认为准。当前官方文档基线至少要求 ACK Virtual Node 支持 Agent Sandbox compute、`ack-agent-sandbox-controller` 和 `ack-sandbox-manager`；原生动态 JWT profile 至少要求 manager `0.6.8`、identity `0.4.1-rc.1` 并开启 token delegation。Enhanced Traffic 当前至少要求 controller `0.5.22`、manager `0.6.8`；TrafficPolicy 基础能力要求 Poseidon `0.7.0`，使用端口规则时要求 `0.7.3`。M0 PoC 必须记录实际安装版本、全局开关和兼容矩阵，不能只依赖文档中的最低版本。
 
@@ -502,6 +509,7 @@ ACS Agent Sandbox 是唯一生产 SandboxProvider，不实现第二生产后端�
 
 M0 新增通用 remote contract、`AliyunAgentSandboxProvider` 和 broker，不把 Core 直接变成 Kubernetes 管理员：
 
+- 通用 remote contract 必须通过中立性评审：对照至少一个非 ACS 的纸面后端设计（例如自建 Firecracker/Kata worker pool）验证抽象不漏；`trafficAccessToken`、`SandboxSet/SandboxClaim` 形态等 ACS 专有语义只能留在 provider 与私有 layer，不得进入通用接口、强类型 DTO 或 broker 协议。
 - `enginehub-sandbox-broker` 是可信、无公网入口的控制服务。Core→Broker assertion 使用 Sandbox-control 专用签名 key，声明 `iss=enginehub-core/aud=enginehub-sandbox-broker/purpose=control/kid/org/actor/scope/scopeVersion/session/controlOperationId/nbf/iat/exp/jti/method/path/headerSha256/bodySha256`；Core 或 Tool Gateway→Data Gateway 分别使用 issuer 专用 key，`iss` 只能是 allowlist 中的 `enginehub-core` 或 `enginehub-sandbox-tool-gateway`，并固定 `aud=enginehub-sandbox-data/purpose=data`。Control/data verifier、audience、key ring 和 replay domain 完全分离，Broker 在创建 lease/quota reservation 的同一事务原子消费 control `jti`；assertion 不转发给任何阿里云组件。
 - Broker 只通过私网 TLS 调用 Manager，并经 mTLS 前置代理将运行时 Team API key 限制到 provision/connect/status/kill 所需固定路由；显式拒绝 `/api-keys`、`/teams` 和全部密钥管理路径。JWT-enabled provision 必须走官方已文档化、会返回 `trafficAccessToken` 的 Manager create/claim API。Sandbox 集群内的 ACS-local adapter 只用 namespace-scoped ServiceAccount 观察/readback/清理 CR；除非专项 PoC 证明可调用官方 token 签发接口，否则不得直接创建将被置为 ready 的 Claim。Manager、SandboxGateway 和 E2B endpoint 不暴露公网，主 ACK/Core/Broker 不持有 Sandbox 集群 kubeconfig，RBAC 只授予 ACS-local adapter/controller。
 - Broker 的 durable `SandboxLease` 固定记录 `provider=acs-agent-sandbox`，并保存 `leaseId/controlOperationId/controlRequestHash/sandboxId/crUid/runtimeIdentity/org/actor/scope/scopeVersion/session/generation/podUid/imageDigest/executionClass/workspaceVersion/policyRevision/managerKeyId/nativeTokenCipherRef/state/expiry/killEpoch`。状态为 `requested|claiming|ready|failed|terminating|destroyed`：`requested` 可进入 `claiming/failed/terminating`；`claiming/ready/failed` 均可进入 `terminating`；只有已证明从未 dispatch 且远端 absent 的 `requested` 可直接进入 `destroyed`；`terminating` 只有 observed absent 后才能进入 `destroyed`。每个转换带 expected state/generation CAS、审计和 outbox，quota/token 只在 `destroyed` 后释放/擦除。
@@ -640,6 +648,14 @@ ACS agent-runtime/traffic-proxy 与用户容器位于同一 Pod 并共享网络�
 22. `E2B-Traffic-Access-Token`、`X-API-KEY`、`trafficAccessToken` 和 create 响应不会进入任何代理/应用日志、trace、crash dump 或 support bundle；RDS key store 只保存 HMAC，Manager 专用 RDS 网络与 KMS 凭证边界通过验证。
 
 Namespace、RBAC、普通 runC、默认 ServiceAccount、Kubernetes Secret、默认 Pod 网络、资源 request、sidecar 和单独 NetworkPolicy 都不得被描述为完整 Sandbox 安全边界。
+
+### 7.11 成本与运维承载力
+
+本方案最现实的失败模式不是设计缺陷，而是拓扑超出团队的运维承载力。因此成本与承载力评估是硬门槛：M0a IaC 前完成第一版，M0b 进入前复核并由预算责任人签字。
+
+成本面至少包含：双 ACK Managed Pro 控制面、受信 ECS 系统节点、ACS MicroVM 按量计费、双 VPC/NAT/ALB/WAF、KMS、SLS 存储与检索、ACR Enterprise、Manager key store 专用 RDS MySQL（ACS 选型税）、Prometheus、OSS、跨 AZ 流量与备份。估算分两档给出月度区间与告警阈值：仅 M0a（单可信集群，无 Sandbox 平面）与 M0a+M0b 全量拓扑。
+
+承载力评估至少覆盖：Kubernetes 与 admission policy 工程、mTLS/PKI 生命周期、KMS 密钥运维、双集群网络取证、7×24 on-call。每项写明责任人；团队不具备的能力必须给出采购、托管或缩减范围的决定，不得默认由上线后再补承担。
 
 ## 8. 身份、Scope 和授权模型
 
@@ -1161,55 +1177,86 @@ Decision 至少记录：
 
 `authorization_fail_open_total` 必须始终为零。关键 audit 无法持久化时，敏感操作拒绝并告警。
 
+治理查询的用户可用性方程是 min(源库, Query Gateway, Governance API, 治理库)：audit-before-delivery 让治理库故障直接表现为查询不可用。这是接受的 fail-closed 代价，必须体现在容量规划、告警和值班手册中，不得事后以放宽审计顺序换取可用性。
+
+初始服务目标（进入实现前由容量规划校准，验收时回归）：
+
+- 治理控制面 API p95 ≤ 500 毫秒。
+- PDP 决策 p95 ≤ 150 毫秒。
+- 小聚合 governed query（限额内 ≤ 100 行）端到端 p95 ≤ 3 秒。
+- 治理库启用 PITR：RPO ≤ 5 分钟、RTO ≤ 30 分钟，恢复演练进入第 20 节测试矩阵。
+
 ## 17. 渐进迁移计划
 
 ### Phase 0：基线、仓库边界和旧系统围栏
 
 范围：
 
-- 盘点 AIE 表、JSON、对象路径、凭证、外部服务和全部数据访问入口。
+- 盘点 AIE 表、JSON、对象路径、凭证、外部服务和全部数据访问入口；兄弟仓库 `demo-odata-service` 是现役权限执行点，即使其功能迁移排在 Phase 7，其令牌形态、权限查询路径和凭证也必须进入本次盘点与威胁模型。
 - 区分代码已实现、文档声称实现和仅 UI 暴露，建立 legacy id 映射和 Northstar 回归集。
-- 审计私有 `main` 相对 upstream 的 7 个提交和 14 个 Core 文件差异；通用修复回 upstream，组织内容回 layer，再同步 `main`。
+- 审计私有 `main` 相对 upstream 的全部 Core 差异，以当时 fetch 的两个 remote 为准，不依赖本文历史提交数；通用修复回 upstream，组织内容回 layer，再同步 `main`。
+- 把通用平台变更拆成不含 AIE 语境的 upstream RFC（extension 身份与网关、Kubernetes hosting target、Sandbox contract/lifecycle）并提交 upstream；取得方向性认可前不开始对应实现，被拒项回架构评审决定偏差预算或重新设计。
+- 对旧 AIE 三个已确认高危项——judge fail-open、管理员治理 bypass、`EnterpriseDataSource.credentialJson` 明文——做出显式处置决定：修复、补偿控制或明示接受，由数据与安全责任人签字并设复审日期，不得默认带病运行到 Phase 7。
 - 冻结旧 AIE 新增敏感数据源、长期凭证和新直连 ETL；收紧旧网络路径、数据库角色并轮换已暴露风险的凭证。
 - 为数据库和对象存储创建可恢复快照，并为每个迁移域定义单一 writer、切换 fence 和回退时限。
 
 退出标准：
 
 - 选定 upstream SHA 后，私有 `main` 在 `deploy/layers/**` 之外与该 SHA 的 tree diff 必须为空，并由 CI 机械验证；AIE 开发只在 `aie` 和 organization layer。
+- upstream RFC 已提交并有方向性结论；被拒项有架构评审决策记录。
+- 旧 AIE 高危项处置决定已签字归档，含补偿控制和复审日期。
 - 每个领域有权威写入方、切换顺序和数据库级写入 fence。
 - 文档漂移、旁路入口和凭证清单全部登记。
 - 备份恢复和切换前回退完成演练。
 
-### Phase 1 / M0：通用平台基础
+### Phase 1 / M0：通用平台基础（M0a ∥ M0b）
+
+M0 拆分为两个并行推进、独立验收的子里程碑。M0a 是治理主干，阻塞 M1 和 Phase 3 的 UI/API 查询；M0b 是 Sandbox 平面，只阻塞 Phase 3 的 Pi 开放和一切 Sandbox 能力。ACS Public Preview 的任何延误只推迟 M0b 及其下游，不得阻塞治理线。两个子里程碑都不登记企业数据源、不读取业务数据。
+
+#### M0a：治理主干（阻塞 M1）
 
 范围：
 
 - upstream 实现 capability-aware Agent/viewer extension gateway、版本化 manifest 和 `/v1/apis` 发现。
 - upstream 实现所有 Scope 类型的实时成员资格/revision 契约、request-bound assertion、durable replay 防护、pre-model egress hook 和 pre-persist hook。
-- upstream 实现 plugin 退出全局 `CORE_SIGNING_SECRET`、extension 专用非对称身份、通用 Kubernetes hosting target、Kubernetes/remote SandboxProvider 和独立 Sandbox Tool Gateway。
-- upstream 扩展强类型 Sandbox request/handle、control/data 独立 assertion、持久 control state machine/operation receipt、显式 egress `deny_all/allowlist` 语义和 provider capability matrix；迁移旧 `allowedHosts: []` 的 allow-all 语义。
-- upstream 重塑 WorkspaceStore，去除生产 local-path 假设并增加 immutable manifest/version、stage-in、幂等 CAS commit、ephemeral profile 和 orphan recovery；实现 OSS/S3-compatible object store contract 与 Alibaba KMS secret source，现有 local/AWS-only 实现不能作为 ACK 生产后端。
-- upstream 为 ACS-only production routing 增加硬门禁：拒绝 secondary、非 ACS durable route、admin per-scope migration、unknown/stale handle 和静默 default fallback。
-- ACK layer 提供双集群/双 VPC Helm/IaC、最小 RRSA、KMS、ALB、SLS、ACR、namespace、ServiceAccount、ACK Virtual Node、Agent Sandbox 组件、TrafficPolicy/GlobalTrafficPolicy/GlobalSecurityProfile/SecurityProfile 和多可用区参数。
-- 建立 Sandbox Broker、EngineHub Sandbox Data Gateway、durable SandboxLease/reconciler、Manager Team-key proxy/MySQL key store、workspace version/CAS 和三种交互 execution class；`trusted-build` 独立留在 CI。首发显式禁用尚无 KubernetesDeployProvider 的 Apps 发布。
-- 只实现 `AliyunAgentSandboxProvider`：独立 Sandbox ACK 集群通过 ACK Virtual Node 调度 ACS Agent Sandbox compute，完成 SandboxSet Warm Pool、SandboxClaim、EngineHub Data Gateway→原生 SandboxGateway、Enhanced Traffic 和 runtime identity PoC；Public Preview 阶段先用 synthetic/低敏数据，不实现其他生产 Sandbox backend。
+- upstream 实现 plugin 退出全局 `CORE_SIGNING_SECRET`、extension 专用非对称身份和通用 Kubernetes hosting target。
+- upstream 实现 OSS/S3-compatible object store contract 与 Alibaba KMS secret source，替换 durable file/blob 与 secret 的 local/AWS-only 生产假设。
+- ACK layer 提供主 ACK（可信平面）Helm/IaC、最小 RRSA、KMS、ALB、SLS、ACR、namespace、ServiceAccount 和多可用区参数；首发显式禁用尚无 KubernetesDeployProvider 的 Apps 发布。
 - 合并并发布 upstream 版本，私有 fork 同步该版本；确认 organization slug 和 ACK Region/VPC 后，用支持 `--target kubernetes` 的 CLI 初始化 layer。
 - 建立 Governance API/Query/Worker skeleton、独立治理 Schema、correlation id、事务 audit/outbox 和 workload 网络隔离。
 
 退出标准：
 
-- M0 的 API/Query/Worker 三个治理 workload 均不持有 `CAPABILITY_SECRET` 或全局 `CORE_SIGNING_SECRET`，不能调用无关 Core 路由。
+- API/Query/Worker 三个治理 workload 均不持有 `CAPABILITY_SECRET` 或全局 `CORE_SIGNING_SECRET`，不能调用无关 Core 路由。
 - Agent/viewer assertion 的 path/body/header 绑定、单次消费、幂等重放和跨 organization 拒绝有集成测试。
 - personal/channel/team/org/group 的撤权在下一请求生效；无法实时验证时 fail closed。
-- ACK 能够挂载 Portal/UI/API，路由无冲突，RRSA/KMS/Query/Worker 网络策略可验证；durable Workspace/Object/Secret 后端在多副本升级、重建和回滚中不丢状态。
+- ACK 能够挂载 Portal/UI/API，路由无冲突，RRSA/KMS/Query/Worker 网络策略可验证；durable file/object 与 secret 后端在多副本升级、重建和回滚中不丢状态。
+- 成本与运维承载力第一版估算完成并有预算责任人结论。
+
+#### M0b：Sandbox 平面（阻塞 Pi 数据访问，可与 M1 并行）
+
+范围：
+
+- upstream 实现 Kubernetes/remote SandboxProvider 和独立 Sandbox Tool Gateway。
+- upstream 扩展强类型 Sandbox request/handle、control/data 独立 assertion、持久 control state machine/operation receipt、显式 egress `deny_all/allowlist` 语义和 provider capability matrix；迁移旧 `allowedHosts: []` 的 allow-all 语义。
+- upstream 重塑 WorkspaceStore，去除生产 local-path 假设并增加 immutable manifest/version、stage-in、幂等 CAS commit、ephemeral profile 和 orphan recovery。
+- upstream 为 ACS-only production routing 增加硬门禁：拒绝 secondary、非 ACS durable route、admin per-scope migration、unknown/stale handle 和静默 default fallback。
+- 通用 remote contract 通过 7.3 节要求的非 ACS 纸面后端中立性评审。
+- 对应 upstream 能力同样先合并、发布并同步私有 fork，再被私有 layer 依赖。
+- ACK layer 提供 Sandbox 集群/双 VPC Helm/IaC、安全准入、ACK Virtual Node、Agent Sandbox 组件和 TrafficPolicy/GlobalTrafficPolicy/GlobalSecurityProfile/SecurityProfile 参数。
+- 建立 Sandbox Broker、EngineHub Sandbox Data Gateway、durable SandboxLease/reconciler、Manager Team-key proxy/MySQL key store、workspace version/CAS 和三种交互 execution class；`trusted-build` 独立留在 CI。
+- 只实现 `AliyunAgentSandboxProvider`：独立 Sandbox ACK 集群通过 ACK Virtual Node 调度 ACS Agent Sandbox compute，完成 SandboxSet Warm Pool、SandboxClaim、EngineHub Data Gateway→原生 SandboxGateway、Enhanced Traffic 和 runtime identity PoC；Public Preview 阶段先用 synthetic/低敏数据，不实现其他生产 Sandbox backend。
+- M0b 进入前，成本与运维承载力评估经复核并由预算责任人签字。
+
+退出标准：
+
 - ACS production profile、Sandbox CR/claim、ACK Virtual Node scheduling、EngineHub Data Gateway、原生 `trafficAccessToken`、sandbox daemon transport、request-bound data plane、Enhanced Traffic default-deny、metadata/Core/DB 拒绝、Tool Gateway、镜像签名、no-token Pod、workspace manifest/CAS、多 Core fencing 和 orphan cleanup conformance 通过。
 - Provision 的确定性 Claim/状态机、remote receipt/`outcome_unknown`、retry-until-absent teardown、Team key drain rotation 和 admin-key leak recovery conformance 通过。
 - provider capability matrix 证明 V1 全部 class 会拒绝 backup/pause/hibernate/checkpoint/clone/persistence；Warm Pool 分配、补池、Claim 后删除和异常实例清理符合 policy。
 - egress 空 allowlist 不会放行，path/method/action 未实现时配置被拒绝；同步安全审计失败时 lease gate fail closed。
 - Sandbox policy、ACK Virtual Node、Manager、EngineHub Data Gateway、原生 SandboxGateway 或 Egress Gateway 不可用时拒绝 provision/exec；不允许回退任何其他 backend。
-- 该阶段不登记企业数据源，也不读取业务数据。
 
-### Phase 2 / M1：PostgreSQL Metadata Catalog
+### Phase 2 / M1：PostgreSQL Metadata Catalog（依赖 M0a，不依赖 M0b）
 
 目标：管理员能在 EngineHub 中登记 PostgreSQL 数据源，安全保存凭证，发现 metadata-only Asset，并将表定义发布为 Dataset；不预览、Profile、查询或导出业务数据。
 
@@ -1237,17 +1284,22 @@ Decision 至少记录：
 - 显式 Principal/Scope DataGrant 的字段、常量行约束、聚合、预算和 `asset.profile` policy；不做动态 ABAC。
 - Decision-before-access、加密临时 spool、audit-before-delivery 和故障时销毁结果。
 - 先向治理 UI/API 开放低敏聚合查询；classification-to-provider 策略和 pre-model/pre-persist hook 通过后，再注册 Pi Skill 和 `/v1/apis`。
-- Pi 开放前同时通过生产 SandboxProvider、Tool Gateway 和 governed ephemeral stream 安全门槛；开放后让 Web、Slack、cron、background 走同一 Core gateway、PDP/PEP 和 Sandbox Broker。
+- Pi 开放前同时通过 M0b 全部退出标准和 governed ephemeral stream 安全门槛；M0b 未完成时 Phase 3 停在 UI/API 开放，并可按 UI/API 组退出标准单独验收。开放后让 Web、Slack、cron、background 走同一 Core gateway、PDP/PEP 和 Sandbox Broker。
 
-退出标准：
+退出标准（UI/API 查询开放，不依赖 M0b）：
 
-- Sandbox 中无 `DATASET_DATABASE_URL`、ServiceAccount token、RRSA、AccessKey、KMS/Manager key，网络无法直连源数据库、Core、治理库、metadata 或其他租户。
 - 未授权字段、行、join、CTE、subquery 和聚合在 SQL 发送前拒绝。
 - 所有物理查询可追溯到已提交的 Decision 和 DatasetVersion，audit 失败时结果不交付。
 - Scope/Grant 撤销后下一次查询立即拒绝。
-- Scope/Grant 撤销同时 fence 正在运行的 governed Sandbox，切断 egress/stage-out 并在 SLO 内销毁。
-- export 和 streaming 仍关闭；未经批准的 provider 不接收结果，被拒内容不进入任何持久层。
+- export 和 streaming 仍关闭；被拒内容不进入任何持久层。
 - 首个合法查询可从已登记 Data Owner、低敏 classification 和有限 DataGrant 完整追溯，且 bootstrap `org_admin` 本身仍无数据访问权。
+- governed query 延迟与治理库恢复满足第 16 节的服务目标回归。
+
+退出标准（Pi 开放，另需 M0b 全部退出标准）：
+
+- Sandbox 中无 `DATASET_DATABASE_URL`、ServiceAccount token、RRSA、AccessKey、KMS/Manager key，网络无法直连源数据库、Core、治理库、metadata 或其他租户。
+- classification-to-provider 策略生效，未经批准的 provider 不接收结果；pre-model 与 pre-persist hook 通过持久化泄漏测试。
+- Scope/Grant 撤销同时 fence 正在运行的 governed Sandbox，切断 egress/stage-out 并在 SLO 内销毁。
 - `governed-data-compute` 无公网、无持久化；`internet-research` 不接收企业原始数据。Phase 5 前禁止跨类持久交换，Phase 5 后只能通过 Governance Artifact Service 和 DLP。
 
 ### Phase 4：Policy、审批和灰度执行
@@ -1357,6 +1409,7 @@ Decision 至少记录：
 - 数据迁移数量、外键、Schema hash、对象 checksum 和增量 lag。
 - 文件分享、会话 fork、附件/报告转发和权限撤销。
 - 故障注入：identity、policy、audit、secret store、source database、worker lease。
+- 治理路径负载与容灾：governed query 端到端延迟预算回归、治理库 PITR 恢复演练（验证第 16 节 RPO/RTO）、audit 库不可用时 fail closed 与恢复后的追赶行为。
 - 审计时序：Decision 未提交不访问源端，completion 未提交不交付，audit 失败不 streaming，mutation 状态/audit/outbox 原子提交。
 - Artifact reconciliation：completion commit 成功但 ack 丢失、重复 completion、API 暂时不可用、pending 过期和 abort/delete CAS。
 - Sandbox contract：现有基础接口、production profile 必选能力、provider capability matrix、daemon transport、Tool Gateway 和 broker lifecycle/generation fencing 分别测试，不把 pause/resume 误称为现有接口；secondary、非 ACS route、migration、unknown handle 和 default fallback 均被生产门禁拒绝。
@@ -1403,7 +1456,7 @@ Decision 至少记录：
 | 正式 organization layer slug | 暂用 `aie`                                    | 初始化 deployment layer 前 |
 | `aie` Core 偏差              | Phase 0 先回 upstream 或移入 layer            | 任何实现前                 |
 | ACK Region/VPC/账号边界      | 主 ACK 与 Sandbox 强制分 VPC；优先分账号      | M0 IaC 前                  |
-| ACS Agent Sandbox 上线准入   | T-90 执行 go/no-go；失败则延迟 Sandbox 上线   | 生产上线前 90 天           |
+| ACS Agent Sandbox 上线准入   | T-90 go/no-go；失败只延迟 M0b/Sandbox，签字材料写明产品代价 | 生产上线前 90 天           |
 | Agent Sandbox 集群形态       | 固定独立 ACK + ACK Virtual Node + ACS compute | M0 IaC 前                  |
 | Sandbox 唯一生产后端         | `acs-agent-sandbox`，禁止所有 fallback        | M0 PoC 前                  |
 | Public Preview 风险接受      | 明确允许数据分类、责任人和到期复审            | 首次低敏生产前             |
@@ -1424,6 +1477,9 @@ Decision 至少记录：
 | Pre-model/pre-persist hooks  | 做成通用 upstream 能力                        | 任何 Pi 数据查询前         |
 | 切换后回滚                   | 第一次权威写入后默认 forward recovery         | 每个领域切换前             |
 | 旧决策日志保留期             | 加密归档，不作为授权事实                      | 数据迁移前                 |
+| upstream RFC 接受度          | Phase 0 先取得方向性认可；被拒项回架构评审    | M0 动工前                  |
+| 旧 AIE 高危项处置            | fail-open/bypass/明文凭证签字决定修复或接受   | Phase 0 退出前             |
+| 成本与运维承载力             | M0a IaC 前估算；M0b 进入前复核签字            | M0a IaC 前 / M0b 进入前    |
 
 后续应把以下决策拆成独立 ADR：
 
@@ -1442,23 +1498,30 @@ Decision 至少记录：
 - Governed Artifact 与普通 workspace 的持久化边界。
 - 垂直切片迁移与禁止长期双写。
 
-## 22. 最初两个实施边界
+## 22. 最初的实施边界
 
-架构批准后先做 M0，不能把平台契约设计和可用 Catalog 合并成一个里程碑。
+架构批准后先做 M0，不能把平台契约设计和可用 Catalog 合并成一个里程碑。M0 按 AD-18 拆成并行的 M0a 与 M0b：M0a 阻塞 M1；M0b 只阻塞 Pi 数据访问和 Sandbox 能力，可与 M1 并行，ACS Public Preview 延误不得阻塞治理线。
 
-### M0：平台基础
+### M0a：治理主干平台基础
 
-- 完成 Phase 0 的 `aie` Core 偏差处置。
-- upstream 实现并合并 extension manifest、Agent/viewer gateway、实时 Scope 撤权、replay protection、plugin secret opt-out、pre-model/pre-persist hook、Kubernetes hosting target、Kubernetes/remote SandboxProvider 和 Sandbox Tool Gateway。
-- upstream 补齐强类型 Sandbox DTO、独立 control/data assertion、Claim 状态机/operation receipt、ACS-only router 门禁、capability matrix、显式 egress mode、无 local-path 的 ACK durable WorkspaceStore、OSS/object store 和 Alibaba KMS secret source。
-- 发布 qm 版本并同步私有 fork。
-- 确认 organization slug、ACK Region/VPC/集群规格，用支持 Kubernetes target 的 CLI 正式初始化 `deploy/layers/<org>`。
-- 在私有 layer 中建立双 ACK/双 VPC Helm/IaC、RRSA/KMS、网络、安全准入、Sandbox Broker、EngineHub Data Gateway 和 `AliyunAgentSandboxProvider`；使用 synthetic/低敏数据完成 ACS Agent Sandbox PoC。
+- 完成 Phase 0 的 `aie` Core 偏差处置和 upstream RFC 方向性认可。
+- upstream 实现并合并 extension manifest、Agent/viewer gateway、实时 Scope 撤权、replay protection、plugin secret opt-out、pre-model/pre-persist hook 和通用 Kubernetes hosting target。
+- upstream 实现 OSS/S3-compatible object store contract 和 Alibaba KMS secret source。
+- 发布 qm 版本并同步私有 fork；确认 organization slug、ACK Region/VPC/集群规格，用支持 Kubernetes target 的 CLI 正式初始化 `deploy/layers/<org>`。
+- 在私有 layer 建立主 ACK Helm/IaC、RRSA/KMS、ALB、SLS、ACR、namespace/ServiceAccount 和多可用区参数；ACK 首发显式禁用尚无 KubernetesDeployProvider 的 Apps 发布。
 - 创建 Governance API/Query/Worker 空骨架和独立数据库/网络边界，但不登记企业数据源。
 
-M0 完成标准是：一个不包含 AIE 业务语义的示例 extension 能在主 ACK 从 Agent 和 Portal 经过 Core 身份网关到达私有服务；`AliyunAgentSandboxProvider` 能在独立 Sandbox ACK 经 ACK Virtual Node 创建 ACS MicroVM，Sandbox contract、ACS-only router、Broker/Data Gateway、原生 `trafficAccessToken`、Claim 状态机/幂等、Enhanced Traffic、Tool Gateway、workspace manifest/CAS、跨租户、组件故障和 orphan 清理全部通过且 fail closed。ACS 不可用时返回 `SANDBOX_UNAVAILABLE`；Docker 仅用于本地开发，不构成生产验收或 fallback。
+M0a 完成标准是：一个不包含 AIE 业务语义的示例 extension 能在主 ACK 从 Agent 和 Portal 经过 Core 身份网关到达私有服务；durable file/object 与 secret 后端在多副本升级、重建和回滚中不丢状态；成本与运维承载力第一版估算有预算责任人结论。
 
-### M1：PostgreSQL Metadata Catalog
+### M0b：Sandbox 平面（可与 M1 并行）
+
+- upstream 实现并合并 Kubernetes/remote SandboxProvider、Sandbox Tool Gateway、强类型 Sandbox DTO、独立 control/data assertion、Claim 状态机/operation receipt、ACS-only router 门禁、capability matrix、显式 egress mode 和无 local-path 的 ACK durable WorkspaceStore；contract 通过非 ACS 纸面后端的中立性评审。
+- 在私有 layer 建立 Sandbox ACK/双 VPC Helm/IaC、安全准入、Sandbox Broker、EngineHub Data Gateway 和 `AliyunAgentSandboxProvider`；使用 synthetic/低敏数据完成 ACS Agent Sandbox PoC。
+- 进入前完成成本与运维承载力复核签字。
+
+M0b 完成标准是：`AliyunAgentSandboxProvider` 能在独立 Sandbox ACK 经 ACK Virtual Node 创建 ACS MicroVM，Sandbox contract、ACS-only router、Broker/Data Gateway、原生 `trafficAccessToken`、Claim 状态机/幂等、Enhanced Traffic、Tool Gateway、workspace manifest/CAS、跨租户、组件故障和 orphan 清理全部通过且 fail closed。ACS 不可用时返回 `SANDBOX_UNAVAILABLE`；Docker 仅用于本地开发，不构成生产验收或 fallback。
+
+### M1：PostgreSQL Metadata Catalog（依赖 M0a）
 
 - `aie_governance` Schema 和 Catalog 核心表。
 - 运维预置的 opaque secretRef、结构化 endpoint 和 PostgreSQL read-only connection test。
@@ -1544,7 +1607,10 @@ AIE：
 
 - 接受“EngineHub 产品内一体、治理服务独立进程”的边界。
 - 接受 Agent 不再直连数据库。
-- 接受 M0 先完成 upstream 通用平台契约，M1 才做 PostgreSQL metadata-only Catalog。
+- 接受 M0 拆分为并行的 M0a 与 M0b：M1 只依赖 M0a；Pi 数据访问和一切 Sandbox 能力另依赖 M0b，ACS 延误不阻塞治理线。
+- 接受 upstream RFC 方向性认可是 M0 动工前置；被拒项回架构评审决策，不静默积累 core 偏差。
+- 接受 Phase 0 对旧 AIE fail-open、管理员 bypass 和明文凭证的签字处置（修复或明示接受）。
+- 接受成本与运维承载力评估分别是 M0a IaC 与 M0b 进入的门槛。
 - 接受 Query、Profile、Pi 接入和 export 分别在后续安全前置条件满足后开放。
 - 接受通用 extension 能力以 upstream-compatible 方式实现，并让治理 workload 不获得全局 Core secret。
 - 接受旧 AIE 按领域单写切换，不做长期双向双写。
