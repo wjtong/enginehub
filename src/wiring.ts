@@ -18,6 +18,7 @@ import {
   type PersistedApprovedHarnesses,
   type PersistedWebuiModels,
   type PersistedPeopleDirectoryUrl,
+  type PersistedAckEmoji,
   type PersistedBranding,
   type PersistedBrowseMaxSteps,
   type PersistedBrowseModel,
@@ -48,6 +49,7 @@ import type {
   PendingApprovalRecord,
   ScopeId,
   SurfaceContextRequest,
+  Webhook,
 } from "./types.ts";
 import { scopeId } from "./types.ts";
 import { createAuditLog, type AuditLog } from "./audit/audit-log.ts";
@@ -70,9 +72,12 @@ import {
 import { createIdempotencyStore, type IdempotencyRecord } from "./idempotency/idempotency-store.ts";
 import { createScheduler, type Scheduler } from "./cron/scheduler.ts";
 import { createPgBossCronQueue } from "./cron/job-queue.ts";
+import { createWebhookStore, disableLegacyWebhookRows } from "./webhooks/webhook-store.ts";
+import { createWebhookReceiver, type WebhookReceiver } from "./webhooks/webhook-receiver.ts";
 import { createDeployStore, type Deployment } from "./deploy/deploy-store.ts";
 import { createDockerDeployProvider } from "./deploy/docker-deploy-provider.ts";
 import { createAwsDeployProvider, type StoredDeployBody } from "./deploy/aws-deploy-provider.ts";
+import { createFlyDeployProvider } from "./deploy/fly-deploy-provider.ts";
 import type { DeployProvider } from "./deploy/deploy-provider.ts";
 import { createDeployService } from "./deploy/deploy-service.ts";
 import {
@@ -337,6 +342,7 @@ export interface BuiltApp {
   skillFetcher: SkillPackFetcher;
   auditLog: AuditLog;
   scheduler: Scheduler;
+  webhookReceiver: WebhookReceiver;
   admin: AdminService;
   rateLimiter: RateLimiter;
   errors: ErrorLog;
@@ -447,6 +453,7 @@ export function buildApp(
     interactiveFastMode: artifactMap<PersistedScopedFlag>("interactive_fast_mode_flag"),
     webuiModels: artifactMap<PersistedWebuiModels>("webui_model_configs"),
     peopleDirectoryUrls: artifactMap<PersistedPeopleDirectoryUrl>("people_directory_urls"),
+    ackEmoji: artifactMap<PersistedAckEmoji>("ack_emoji"),
     branding: artifactMap<PersistedBranding>("branding_configs"),
     browseMaxSteps: artifactMap<PersistedBrowseMaxSteps>("browse_max_steps_configs"),
     browseModels: artifactMap<PersistedBrowseModel>("browse_model_configs"),
@@ -863,17 +870,19 @@ export function buildApp(
         : {}),
     },
   });
-  const deployProvider: DeployProvider =
-    config.deployProvider === "aws"
-      ? createAwsDeployProvider({
-          ...config.awsDeploy,
-          ...(!config.awsDeploy.dataBucket && config.awsSandbox.s3Bucket
-            ? { dataBucket: config.awsSandbox.s3Bucket }
-            : {}),
-          advisoryLock,
-          store: artifactMap<StoredDeployBody>("aws_deploy_bodies"),
-        })
-      : createDockerDeployProvider();
+  const deployProvider: DeployProvider = ((): DeployProvider => {
+    if (config.deployProvider === "aws")
+      return createAwsDeployProvider({
+        ...config.awsDeploy,
+        ...(!config.awsDeploy.dataBucket && config.awsSandbox.s3Bucket
+          ? { dataBucket: config.awsSandbox.s3Bucket }
+          : {}),
+        advisoryLock,
+        store: artifactMap<StoredDeployBody>("aws_deploy_bodies"),
+      });
+    if (config.deployProvider === "fly") return createFlyDeployProvider(config.flyDeploy);
+    return createDockerDeployProvider();
+  })();
   if (config.deployProvider === "aws" && !config.awsDeploy.dataBucket && !config.awsSandbox.s3Bucket) {
     console.warn(
       "[wiring] aws deploy: no data bucket resolved (AWS_DEPLOY_DATA_BUCKET unset, sandbox is not aws) — deployed apps have NO durable /data",
@@ -945,6 +954,9 @@ export function buildApp(
       cronChanged.notify?.(id);
     },
   };
+  const webhooks = createWebhookStore(artifactMap<Webhook>("webhooks"));
+  if (pgArtifactMap)
+    void disableLegacyWebhookRows(pgArtifactMap.pool).catch(swallowAs("wiring: legacy webhook sweep", undefined));
   const deliveries = config.databaseUrl ? createPostgresDeliveryStore(config.databaseUrl) : createDeliveryStore();
   const layerEnv = config.layerEnv ?? {};
   const layerBrokerCache = new Map<string, AwsRoleBroker>();
@@ -1007,6 +1019,7 @@ export function buildApp(
     ...(config.capabilitySecret ? { capabilitySecret: config.capabilitySecret } : {}),
     ...(config.apiBaseUrl ? { apiBaseUrl: config.apiBaseUrl } : {}),
     ...(config.publicWebUrl ? { publicWebUrl: config.publicWebUrl } : {}),
+    ...(config.publicUrl ? { webhookPublicUrl: config.publicUrl } : {}),
     memoryPolicy: { recall: config.memoryRecall, capture: config.memoryCapture },
     memoryStrategy,
     skills,
@@ -1034,6 +1047,7 @@ export function buildApp(
     ...(processes ? { processes } : {}),
     monitors,
     crons,
+    webhooks,
     resolveBaseModelId: () => orgBaseModelId() ?? fallback.modelId,
     ...(config.scratchExecEnabled ? { scratchExec: true } : {}),
     ...(config.sharedOwnerAuthIsolation ? { ownerAuthExec: true, sharedOwnerAuthIsolation: true } : {}),
@@ -1157,6 +1171,7 @@ export function buildApp(
     auditLog,
     config: configStore,
     crons,
+    webhooks,
     deliveries,
     directory,
     projects,
@@ -1336,6 +1351,15 @@ export function buildApp(
     reconcile: (id) => app.syncSkillPack(id),
     leaderLease,
   });
+  const webhookReceiver = createWebhookReceiver({
+    webhooks,
+    deliveries,
+    idempotency,
+    identity,
+    run: (req) => app.turn(req),
+    directory,
+    currentScopeMembers,
+  });
   const reachDeniedNotifier: Sweeper | undefined = config.reachDeniedNotifyChannel
     ? createReachDeniedNotifier({
         auditLog,
@@ -1492,6 +1516,7 @@ export function buildApp(
     skillFetcher,
     auditLog,
     scheduler,
+    webhookReceiver,
     admin,
     rateLimiter,
     errors,
@@ -1535,6 +1560,7 @@ export function serverDeps(
   config: Config,
   built: BuiltApp,
   slackEnvironmentState: "absent" | "configured" | "partial" = "absent",
+  slackEnvBotToken?: string,
 ): Omit<ServerDeps, "control"> {
   const configuredModel = configuredModelForHarness(config, config.harness);
   return {
@@ -1559,6 +1585,7 @@ export function serverDeps(
     connectorTokens: built.connectorTokens,
     slackInstallation: built.slackInstallation,
     slackEnvironmentState,
+    ...(slackEnvBotToken ? { slackEnvBotToken } : {}),
     resolveClient: built.resolveClient,
     consentLinks: built.consentLinks,
     secretDrops: built.secretDrops,
@@ -1585,6 +1612,7 @@ export function serverDeps(
     ...(config.deployAppsSessionSecret ? { deployAppsSessionSecret: config.deployAppsSessionSecret } : {}),
     ...(config.deployAppsLoginUrl ? { deployAppsLoginUrl: config.deployAppsLoginUrl } : {}),
     scheduler: built.scheduler,
+    webhookReceiver: built.webhookReceiver,
     identity: built.identity,
     ...(built.keychain ? { keychain: built.keychain } : {}),
     serviceCreds: built.serviceCreds,

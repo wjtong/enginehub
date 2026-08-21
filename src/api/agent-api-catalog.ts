@@ -149,13 +149,13 @@ const FAMILIES: AgentApiFamily[] = [
   {
     match: (m, p) => m === "POST" && /^\/v1\/triggers\/[^/]+\/consent$/.test(p),
     guidance:
-      "If the person you're helping is told a teammate set up a recurring delivery (a cron that DMs them), THEY control whether it reaches them — not its behavior. When they say yes/no, call this with the ref id from the notice. Reversible anytime; only the recipient can decide.",
+      "If the person you're helping is told a teammate set up a recurring delivery (a cron or webhook that DMs them), THEY control whether it reaches them — not its behavior. When they say yes/no, call this with the ref id from the notice. Reversible anytime; only the recipient can decide.",
     routes: [
       {
         method: "POST",
         path: "/v1/triggers/:id/consent",
         summary:
-          'accept or decline a standing trigger\'s deliveries to you (a teammate\'s cron that DMs you) — body {decision:"accept"|"decline"}; reversible; recipient-only',
+          'accept or decline a standing trigger\'s deliveries to you (a teammate\'s cron/webhook/watch that DMs you) — body {decision:"accept"|"decline"}; reversible; recipient-only',
       },
     ],
   },
@@ -235,7 +235,7 @@ const FAMILIES: AgentApiFamily[] = [
         method: "POST",
         path: "/v1/reach",
         summary:
-          "send a teammate a DM, post to a channel, or post to a group DM RIGHT NOW — `text` plus `recipient`, `channel`, or `participants` (the group DM's other members — the group is opened for you if it doesn't exist yet, so never ask someone to create one), optionally with `files` (workspace-relative paths, attached to the message all-or-nothing). EXTREMELY IMPORTANT: a `channel` post broadcasts to everyone there — pick the narrowest audience that can act; a question or errand for one person goes to their DM (`recipient`), NEVER a public channel, unless the person you're helping explicitly named that channel as the destination or the message genuinely concerns the whole room; pass `threadTs` (the parent message's ts) with a `channel`/`participants` post to reply inside that thread instead of top-level; or react to a message instead of posting with `react:{ts,emoji}` plus a `channel`/`participants`; or retract one of your own messages with `delete:{ts}` (no target = this conversation, or name a `channel`/`participants` to delete elsewhere) — find a message's `ts` via /v1/surface-context; pass `unfurlLinks:false` to suppress Slack previews (no schedule; for later/recurring use /v1/crons)",
+          "send a teammate a DM, post to a channel, or post to a group DM RIGHT NOW — `text` plus `recipient`, `channel`, or `participants` (the group DM's other members — the group is opened for you if it doesn't exist yet, so never ask someone to create one), optionally with `files` (workspace-relative paths, attached to the message all-or-nothing). EXTREMELY IMPORTANT: a `channel` post broadcasts to everyone there — pick the narrowest audience that can act; a question or errand for one person goes to their DM (`recipient`), NEVER a public channel, unless the person you're helping explicitly named that channel as the destination or the message genuinely concerns the whole room; pass `threadTs` (the parent message's ts) with a `recipient`/`channel`/`participants` post to reply inside that thread instead of top-level; or react to a message instead of posting with `react:{ts,emoji}` plus a `channel`/`participants`; or retract one of your own messages with `delete:{ts}` (no target = this conversation, or name a `channel`/`participants` to delete elsewhere) — find a message's `ts` via /v1/surface-context; pass `unfurlLinks:false` to suppress Slack previews (no schedule; for later/recurring use /v1/crons)",
       },
     ],
   },
@@ -306,6 +306,22 @@ const FAMILIES: AgentApiFamily[] = [
         path: "/v1/deployments/:id/restore",
         summary: "restore an archived app you manage by reapplying its current saved version",
       },
+    ],
+  },
+  {
+    match: (m, p) =>
+      (p === "/v1/webhooks" && (m === "POST" || m === "GET")) ||
+      (m === "POST" && /^\/v1\/webhooks\/[^/]+\/(disable|enable)$/.test(p)),
+    when: () => false,
+    routes: [
+      {
+        method: "POST",
+        path: "/v1/webhooks",
+        summary: "register an inbound webhook that runs a prompt when an external system calls it (secret shown once)",
+      },
+      { method: "GET", path: "/v1/webhooks", summary: "list your webhooks" },
+      { method: "POST", path: "/v1/webhooks/:id/disable", summary: "disable a webhook" },
+      { method: "POST", path: "/v1/webhooks/:id/enable", summary: "re-enable a webhook" },
     ],
   },
   {

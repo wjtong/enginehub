@@ -166,6 +166,7 @@ export interface Destination {
   target: string;
   audienceScopeId?: ScopeId;
   onBehalfOf?: string;
+  threadTs?: string;
   editRef?: string;
   taskList?: Array<{
     id: string;
@@ -228,6 +229,24 @@ export interface Cron extends TriggerBase {
   members?: Principal[];
   unattendedGrants?: string[];
   fireLog?: CronFireLogEntry[];
+}
+
+interface WebhookVerification {
+  scheme: "hmac-sha256" | "github" | "slack" | "stripe";
+  secret?: string;
+}
+
+interface WebhookFilter {
+  path: string;
+  in: string[];
+}
+
+export interface Webhook extends TriggerBase {
+  action: string;
+  verification: WebhookVerification;
+  filters?: WebhookFilter[];
+  lastDeliveryId?: string;
+  lastError?: string;
 }
 
 export interface Monitor extends TriggerBase {
@@ -396,6 +415,7 @@ export interface TurnRequest {
   ownerKeychainUnion?: boolean;
   unprompted?: boolean;
   liveActor?: boolean;
+  botActor?: boolean;
   conversationHeader?: string;
   priorTurns?: ConversationTurn[];
   overheard?: OverheardMessage[];
@@ -442,7 +462,7 @@ export interface PendingApproval {
   approvalKey?: string;
   grantModes?: ApprovalGrantModes;
   blocksInput?: boolean;
-  kind?: "approval";
+  kind?: "approval" | "input";
 }
 
 export interface PendingApprovalRecord {

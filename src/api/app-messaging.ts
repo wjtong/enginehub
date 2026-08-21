@@ -38,6 +38,11 @@ export function createMessagingMethods(
   | "setCronEnabled"
   | "setCronDestination"
   | "setCronRecipientConsent"
+  | "createWebhook"
+  | "getWebhook"
+  | "listWebhooks"
+  | "setWebhookEnabled"
+  | "setWebhookRecipientConsent"
   | "pendingDeliveries"
   | "enqueueDelivery"
   | "ingestSurfaceEvents"
@@ -196,6 +201,29 @@ export function createMessagingMethods(
     setCronRecipientConsent(id, recipientConsent) {
       return deps.crons.setRecipientConsent(id, recipientConsent);
     },
+    async createWebhook(input) {
+      const webhook = await deps.webhooks.create(input);
+      deps.auditLog.record({
+        at: Date.now(),
+        principalId: webhook.createdBy,
+        action: "webhook_create",
+        resource: webhook.id,
+        scopeLabel: webhook.ownerScopeId,
+      });
+      return webhook;
+    },
+    getWebhook(id) {
+      return deps.webhooks.get(id);
+    },
+    listWebhooks() {
+      return deps.webhooks.list();
+    },
+    setWebhookEnabled(id, enabled) {
+      return deps.webhooks.setEnabled(id, enabled);
+    },
+    setWebhookRecipientConsent(id, recipientConsent) {
+      return deps.webhooks.setRecipientConsent(id, recipientConsent);
+    },
     pendingDeliveries(type, claimMs) {
       return claimMs && claimMs > 0 ? deps.deliveries.claimPending(type, claimMs) : deps.deliveries.pending(type);
     },
@@ -339,12 +367,12 @@ export function createMessagingMethods(
         });
       }
     },
-    async upsertChannels(channels, channelMembers, syncedAt) {
-      await deps.directory.replaceChannels(channels, channelMembers, syncedAt);
+    async upsertChannels(channels, channelMembers, syncedAt, channelRosterIds, revocations) {
+      await deps.directory.replaceChannels(channels, channelMembers, syncedAt, channelRosterIds, revocations);
       await h.syncLinkedProjectRosters();
     },
-    async upsertGroups(groupMembers, syncedAt) {
-      await deps.directory.replaceGroups(groupMembers, syncedAt);
+    async upsertGroups(groupMembers, syncedAt, groupIds, groupRosterIds) {
+      await deps.directory.replaceGroups(groupMembers, syncedAt, groupIds, groupRosterIds);
     },
     async setDirectoryWorkspaceUrl(url) {
       await deps.directory.setWorkspaceUrl(url);
@@ -439,12 +467,16 @@ export function createMessagingMethods(
         if (r.group) extra.group = r.group;
       }
       if (input.threadTs) {
-        if (baseDestination.type !== "slack" && baseDestination.type !== "group") {
+        if (
+          baseDestination.type !== "slack" &&
+          baseDestination.type !== "group" &&
+          baseDestination.type !== "principal"
+        ) {
           return {
             ok: false,
             status: 400,
             error: "bad_request",
-            message: "threadTs threads a channel or group DM post — a DM to a person has no threads",
+            message: "threadTs requires a Slack channel, group DM, or person DM",
           };
         }
         baseDestination = withThread(baseDestination, input.threadTs);

@@ -45,9 +45,13 @@ interface StoredApprovalView {
 
 interface DirectoryPush {
   members?: Array<{ principalId: string; displayName: string; type: "internal"; slackId?: string }>;
-  channels?: Array<{ channelId: string; name: string; isPrivate?: boolean }>;
+  channels?: Array<{ channelId: string; name: string; isPrivate?: boolean; isExternal?: boolean }>;
   channelMembers?: Array<{ channelId: string; principalId: string }>;
+  channelRosterIds?: string[];
+  channelRevocations?: Array<{ channelId: string; principalId: string }>;
   groupMembers?: Array<{ groupId: string; principalId: string }>;
+  groupIds?: string[];
+  groupRosterIds?: string[];
   workspaceUrl?: string;
   membersSyncedAt?: number;
   channelsSyncedAt?: number;
@@ -56,6 +60,7 @@ interface DirectoryPush {
 
 export interface SlackCoreClient {
   externalSlackParticipants(): Promise<boolean>;
+  ackEmojiOverride(): Promise<string[] | null>;
   surfaceHeaderFacts(scope: ScopeId): Promise<{ agentLabel?: string; modelName: string }>;
   channelHeaderPinEnabled(scope: ScopeId): Promise<boolean>;
   onScopeModelChanged(listener: (scope: ScopeId) => void): void;
@@ -125,6 +130,10 @@ export function createSlackCoreClient(deps: SlackCoreClientDeps): SlackCoreClien
   return {
     async externalSlackParticipants() {
       return (await deps.config.getExternalSlackParticipantsDurable(orgScope)) === true;
+    },
+
+    async ackEmojiOverride() {
+      return await deps.config.getAckEmojiDurable(orgScope);
     },
 
     async surfaceHeaderFacts(scope) {
@@ -302,8 +311,16 @@ export function createSlackCoreClient(deps: SlackCoreClientDeps): SlackCoreClien
     async pushDirectory(body) {
       if (body.workspaceUrl) await deps.app.setDirectoryWorkspaceUrl(body.workspaceUrl);
       if (body.members) await deps.app.upsertDirectory(body.members, body.membersSyncedAt);
-      if (body.channels) await deps.app.upsertChannels(body.channels, body.channelMembers, body.channelsSyncedAt);
-      if (body.groupMembers) await deps.app.upsertGroups(body.groupMembers, body.groupsSyncedAt);
+      if (body.channels)
+        await deps.app.upsertChannels(
+          body.channels,
+          body.channelMembers,
+          body.channelsSyncedAt,
+          body.channelRosterIds,
+          body.channelRevocations,
+        );
+      if (body.groupMembers)
+        await deps.app.upsertGroups(body.groupMembers, body.groupsSyncedAt, body.groupIds, body.groupRosterIds);
     },
 
     claimDeliveries(type, claimMs) {

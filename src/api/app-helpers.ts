@@ -27,7 +27,6 @@ import {
 import { samePerson } from "../directory/person.ts";
 import type { Deployment } from "../deploy/deploy-store.ts";
 import { swallow } from "../util/errors.ts";
-import { commandApprovalId } from "../core/approval-id.ts";
 import {
   openGroupViaSurface,
   resolveReachTarget,
@@ -130,25 +129,25 @@ export function createAppHelpers(deps: AppDeps, app: App) {
     if (!deps.approvals) return [];
     const [entries, session] = await Promise.all([deps.approvals.entries(), deps.sessions.get(sessionId)]);
     if (!session) return [];
-    const candidates: PendingApprovalRecord[] = [];
-    for (const [, record] of entries) {
+    const candidates: Array<{ key: string; record: PendingApprovalRecord }> = [];
+    for (const [key, record] of entries) {
       if (record.sessionId !== sessionId || (opts.blockingOnly && record.blocksInput === false)) continue;
-      if (await approvalRecordIsCurrent(record, session)) candidates.push(record);
+      if (await approvalRecordIsCurrent(record, session)) candidates.push({ key, record });
     }
     const visible = opts.viewer
       ? (
           await Promise.all(
-            candidates.map(async (record) => ({
-              record,
-              allowed: await approvalVisibleToViewer(session, opts.viewer!, record),
+            candidates.map(async (candidate) => ({
+              candidate,
+              allowed: await approvalVisibleToViewer(session, opts.viewer!, candidate.record),
             })),
           )
         )
           .filter(({ allowed }) => allowed)
-          .map(({ record }) => record)
+          .map(({ candidate }) => candidate)
       : candidates;
-    return visible.map((r) => ({
-      requestId: commandApprovalId(r.sessionId, r.command),
+    return visible.map(({ key, record: r }) => ({
+      requestId: key,
       command: r.command,
       reason: r.reason ?? "requires approval",
       ...(r.matched ? { matched: r.matched } : {}),
@@ -401,9 +400,30 @@ export function createAppHelpers(deps: AppDeps, app: App) {
   const membershipControlsScope = createMembershipControlsScope(scopeMembershipDeps);
 
   async function authorizesCapabilityScope(
-    claims: Pick<CapabilityClaims, "actorId" | "scopeId" | "scopeVersion">,
+    claims: Pick<CapabilityClaims, "actorId" | "scopeId" | "scopeVersion" | "botActor" | "liveActor" | "members">,
   ): Promise<boolean> {
     const { kind, ref } = parseScopeId(claims.scopeId);
+    if (kind === "channel" && !deps.identity.isInternal(deps.identity.classify(claims.actorId))) return false;
+    const privateChannel =
+      kind === "channel" && (await deps.directory.channelPrivacy?.(ref).catch(() => undefined)) === true;
+    const capabilityMembership = privateChannel
+      ? await deps.directory.channelMembership(ref, claims.actorId).catch(() => undefined)
+      : undefined;
+    const attestedBot =
+      privateChannel &&
+      claims.botActor === true &&
+      claims.liveActor === true &&
+      claims.members?.some((member) => member.id === claims.actorId && member.type === "internal") === true;
+    if (
+      (kind === "channel" &&
+        !(
+          attestedBot ||
+          (capabilityMembership ?? (await principalCanAccessCurrentScope(claims.actorId, claims.scopeId)))
+        )) ||
+      (kind === "group" && !(await principalCanWriteScope(claims.actorId, claims.scopeId)))
+    ) {
+      return false;
+    }
     if (kind !== "group" || deps.projects?.recognizes(ref) !== true) return true;
     return (
       (await principalCanManageScope(claims.actorId, claims.scopeId)) &&

@@ -35,6 +35,7 @@ import {
   FORWARD_DEPLOYMENT_LAYER_HEADERS,
   FORWARD_OAUTH_HEADERS,
   FORWARD_BROKER_HEADERS,
+  FORWARD_WEBHOOK_HEADERS,
 } from "./proxy.ts";
 import { signedHeaders, withSourceAuthNonce } from "../../chassis/src/core-client.ts";
 import { coreClaimStore, withinRateLimit } from "../../chassis/src/claims.ts";
@@ -201,8 +202,9 @@ export function consumeState(state: string): boolean {
 }
 
 const ADMIN_TTL_MS = 60_000;
-const ADMIN_PROBE_TIMEOUT_MS = 1500;
+const ADMIN_PROBE_TIMEOUT_MS = 6_500;
 const ADMIN_PROBE_ATTEMPTS = 2;
+const ADMIN_PROBE_RETRY_DELAY_MS = 250;
 const adminCache = new LRUCache<string, boolean>({ max: 10_000, ttl: ADMIN_TTL_MS });
 
 async function adminProbeAttempt(sub: string): Promise<boolean | null> {
@@ -217,10 +219,18 @@ async function adminProbeAttempt(sub: string): Promise<boolean | null> {
       );
     }
     const r = await fetch(`${UPSTREAMS.admin}/api/whoami`, { headers, signal: ctrl.signal });
-    if (!r.ok) return null;
-    const j = (await r.json()) as { isAdmin?: boolean };
-    return j.isAdmin === true;
-  } catch {
+    if (!r.ok) {
+      console.warn(`[portal] admin probe returned HTTP ${r.status}`);
+      return null;
+    }
+    const j = (await r.json()) as { isAdmin?: unknown };
+    if (typeof j.isAdmin !== "boolean") {
+      console.warn("[portal] admin probe returned an invalid admin status");
+      return null;
+    }
+    return j.isAdmin;
+  } catch (error) {
+    console.warn(`[portal] admin probe failed: ${errMessage(error)}`);
     return null;
   } finally {
     clearTimeout(timer);
@@ -232,7 +242,11 @@ async function adminProbe(sub: string): Promise<{ isAdmin: boolean; failed: bool
   if (hit !== undefined) return { isAdmin: hit, failed: false };
   for (let attempt = 0; attempt < ADMIN_PROBE_ATTEMPTS; attempt++) {
     const isAdmin = await adminProbeAttempt(sub);
-    if (isAdmin === null) continue;
+    if (isAdmin === null) {
+      if (attempt + 1 < ADMIN_PROBE_ATTEMPTS)
+        await new Promise((resolve) => setTimeout(resolve, ADMIN_PROBE_RETRY_DELAY_MS));
+      continue;
+    }
     adminCache.set(sub, isAdmin);
     return { isAdmin, failed: false };
   }
@@ -939,6 +953,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   const rawPath = rawTarget.split("?")[0] ?? "";
   if (/%2f|%5c|%2e%2e|\\|\x00/i.test(rawPath) || rawPath.includes("//") || pathname.includes("/..")) {
     return json(res, 400, { error: "bad_request", message: "illegal path" });
+  }
+
+  if (method === "POST" && /^\/v1\/webhooks\/incoming\/[^/]+$/.test(pathname)) {
+    return proxyToUpstream(req, res, { baseUrl: CORE, path: pathname, search: url.search }, FORWARD_WEBHOOK_HEADERS);
   }
 
   const consentBounce = (): void => {

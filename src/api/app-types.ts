@@ -41,6 +41,7 @@ import type { CapabilityClaims } from "../auth/capability-token.ts";
 import type { ScopedConfigStore } from "../resolution/config-store.ts";
 import { type AdminService } from "../admin/admin-service.ts";
 import type { CronStore, CreateCronInput, CronPatch } from "../cron/cron-store.ts";
+import type { WebhookStore, CreateWebhookInput } from "../webhooks/webhook-store.ts";
 import type { DeliveryStore } from "../delivery/delivery-store.ts";
 import type {
   ChannelMembership,
@@ -60,6 +61,7 @@ import type {
   SurfaceContextQuery,
   SurfaceContextRequest,
   SurfaceContextResult,
+  Webhook,
 } from "../types.ts";
 import type {
   ActiveThread,
@@ -318,7 +320,9 @@ export interface App {
   listScopeResources(principalId: string, scope: ScopeId): Promise<ScopeResources | null>;
   managesScope(principalId: string, scope: ScopeId): Promise<boolean>;
   membershipControlsScope(scope: ScopeId): Promise<boolean>;
-  authorizesCapabilityScope(claims: Pick<CapabilityClaims, "actorId" | "scopeId" | "scopeVersion">): Promise<boolean>;
+  authorizesCapabilityScope(
+    claims: Pick<CapabilityClaims, "actorId" | "scopeId" | "scopeVersion" | "botActor" | "liveActor" | "members">,
+  ): Promise<boolean>;
   openFileForViewer(id: string, principalId: string): Promise<OpenedFile | null>;
   grant(g: Grant): Promise<void>;
   revokeGrant(ownerScopeId: ScopeId, ref: string, granteeScopeId: ScopeId, revokedBy: string): Promise<void>;
@@ -351,6 +355,11 @@ export interface App {
   setCronEnabled(id: string, enabled: boolean): Promise<void>;
   setCronDestination(id: string, destination: Destination | undefined): Promise<Cron | null>;
   setCronRecipientConsent(id: string, recipientConsent: RecipientConsent): Promise<void>;
+  createWebhook(input: CreateWebhookInput): Promise<Webhook>;
+  getWebhook(id: string): Promise<Webhook | null>;
+  listWebhooks(): Promise<Webhook[]>;
+  setWebhookEnabled(id: string, enabled: boolean): Promise<void>;
+  setWebhookRecipientConsent(id: string, recipientConsent: RecipientConsent): Promise<void>;
   pendingDeliveries(type: string, claimMs?: number): Promise<Delivery[]>;
   enqueueDelivery(input: { destination: Destination; text: string; idempotencyKey: string }): Promise<void>;
   createContextRequest(source: string, query: SurfaceContextQuery): Promise<SurfaceContextRequest>;
@@ -386,8 +395,19 @@ export interface App {
   ackDeliveryByKey(idempotencyKey: string): Promise<void>;
   setRunDeliveryState(runId: string, state: RunDeliveryState): Promise<boolean>;
   upsertDirectory(members: DirectoryMember[], syncedAt?: number): Promise<void>;
-  upsertChannels(channels: DirectoryChannel[], channelMembers?: ChannelMembership[], syncedAt?: number): Promise<void>;
-  upsertGroups(groupMembers: GroupMembership[], syncedAt?: number): Promise<void>;
+  upsertChannels(
+    channels: DirectoryChannel[],
+    channelMembers?: ChannelMembership[],
+    syncedAt?: number,
+    channelRosterIds?: string[],
+    revocations?: ChannelMembership[],
+  ): Promise<void>;
+  upsertGroups(
+    groupMembers: GroupMembership[],
+    syncedAt?: number,
+    groupIds?: string[],
+    groupRosterIds?: string[],
+  ): Promise<void>;
   setDirectoryWorkspaceUrl(url: string): Promise<void>;
   directoryMeta(): Promise<DirectoryMeta>;
   resolveRecipient(query: string): Promise<RecipientResolution>;
@@ -512,6 +532,7 @@ export interface AppDeps {
   auditLog: AuditLog;
   config: ScopedConfigStore;
   crons: CronStore;
+  webhooks: WebhookStore;
   deliveries: DeliveryStore;
   directory: DirectoryStore;
   projects?: ProjectStore;
@@ -592,6 +613,7 @@ interface ScopeSkill {
 
 interface ScopeResources {
   files: FileListItem[];
+  webhooks: Webhook[];
   crons: Cron[];
   deployments: ScopeDeployment[];
   skills: ScopeSkill[];

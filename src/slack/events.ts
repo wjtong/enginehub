@@ -1,5 +1,4 @@
 import {
-  type SlackFile,
   channelPrivacyChange,
   createDeduper,
   dedupeKey,
@@ -11,6 +10,7 @@ import {
   shouldProcessMessage,
 } from "./lib.ts";
 import type { AckGate } from "./deferred-ack.ts";
+import { messageWithForwardedContent } from "./forwards.ts";
 import type { BotIdentity, Directory } from "./directory.ts";
 import type { Mirror } from "./mirror.ts";
 import type { SlackReactionEvent, TurnHandler } from "./turn-handler.ts";
@@ -39,26 +39,54 @@ export function registerSlackEvents(
   const { handler, mirror, directory, ids, deduper } = deps;
   const { dispatch, handleReactionEvent, botHasStakeInThread } = handler;
   const { mirrorMessageEvent, pushSurfaceEvents } = mirror;
-  const { knownPublicChannels, syncForUnseenGroup, forceDirectorySync } = directory;
+  const { syncForUnseenGroup, forceDirectorySync } = directory;
+  const eventIdentity = async (
+    client: any,
+    event: { user?: string; bot_id?: string },
+  ): Promise<{ userId: string; actor?: { externalId: string; isBot: true; displayName?: string } }> => {
+    if (event.user) return { userId: event.user };
+    if (!event.bot_id) return { userId: "" };
+    try {
+      const bot = (await client.bots.info({ bot: event.bot_id })).bot;
+      if (bot?.user_id) return { userId: String(bot.user_id) };
+      if (bot?.id === event.bot_id && bot.deleted !== true) {
+        return {
+          userId: event.bot_id,
+          actor: {
+            externalId: event.bot_id,
+            isBot: true,
+            ...(bot.name ? { displayName: String(bot.name) } : {}),
+          },
+        };
+      }
+    } catch {
+      return { userId: event.bot_id };
+    }
+    return { userId: event.bot_id };
+  };
 
   app.event("app_mention", async ({ event, body, client, context }: any) => {
     const e = event as any;
+    const identity = await eventIdentity(client, e);
     const key = dedupeKey({
       event_id: (body as any)?.event_id,
       client_msg_id: e.client_msg_id,
       channel: e.channel,
       ts: e.ts,
     });
+    const content = messageWithForwardedContent(e);
     await dispatch(
       key,
       {
         kind: "channel",
         channel: e.channel,
-        userId: e.user,
-        rawText: e.text ?? "",
-        files: (e.files as SlackFile[]) ?? [],
+        userId: identity.userId,
+        ...(identity.actor ? { actor: identity.actor } : {}),
+        rawText: content.text,
+        files: content.files,
         threadTs: e.thread_ts,
         ts: e.ts,
+        ...(e.bot_id || e.subtype === "bot_message" ? { botAuthored: true } : {}),
         ackGate: context.ackGate as AckGate | undefined,
       },
       client,
@@ -67,11 +95,8 @@ export function registerSlackEvents(
 
   app.message(async ({ message, body, client, context }: any) => {
     const m = message as any;
-    const privacyChange = channelPrivacyChange(m);
-    if (privacyChange) {
-      if (privacyChange.isPrivate) knownPublicChannels.delete(privacyChange.channel);
-      else knownPublicChannels.add(privacyChange.channel);
-      await forceDirectorySync(client);
+    if (channelPrivacyChange(m)) {
+      await forceDirectorySync(client, m.channel);
       return;
     }
     if (isGroupMembershipMessage(m)) {
@@ -107,23 +132,27 @@ export function registerSlackEvents(
     if (!shouldProcessMessage(m, ids.botUserId, ids.ownBotId)) return;
 
     if (m.channel_type === "im") {
+      const identity = await eventIdentity(client, m);
       const key = dedupeKey({
         event_id: (body as any)?.event_id,
         client_msg_id: m.client_msg_id,
         channel: m.channel,
         ts: m.ts,
       });
+      const content = messageWithForwardedContent(m);
       await dispatch(
         key,
         {
           kind: "dm",
           channel: m.channel,
-          userId: m.user,
+          userId: identity.userId,
+          ...(identity.actor ? { actor: identity.actor } : {}),
           ...(m.bot_profile?.name || m.username ? { authorName: String(m.bot_profile?.name || m.username) } : {}),
-          rawText: m.text ?? "",
-          files: (m.files as SlackFile[]) ?? [],
+          rawText: content.text,
+          files: content.files,
           threadTs: m.thread_ts,
           ts: m.ts,
+          ...(m.bot_id || m.subtype === "bot_message" ? { botAuthored: true } : {}),
           ackGate,
         },
         client,
@@ -151,15 +180,18 @@ export function registerSlackEvents(
         channel: m.channel,
         ts: m.ts,
       });
+      const identity = await eventIdentity(client, m);
+      const content = messageWithForwardedContent(m);
       await dispatch(
         key,
         {
           kind: "channel",
           channel: m.channel,
-          userId: m.user,
+          userId: identity.userId,
+          ...(identity.actor ? { actor: identity.actor } : {}),
           ...(m.bot_profile?.name || m.username ? { authorName: String(m.bot_profile?.name || m.username) } : {}),
-          rawText: m.text ?? "",
-          files: (m.files as SlackFile[]) ?? [],
+          rawText: content.text,
+          files: content.files,
           threadTs: m.thread_ts,
           ts: m.ts,
           unprompted: true,
@@ -196,8 +228,8 @@ export function registerSlackEvents(
             }
           : {}),
       });
-    } else if (!e.channel || !knownPublicChannels.has(e.channel)) {
-      await forceDirectorySync(client);
+    } else {
+      await forceDirectorySync(client, e.channel);
     }
   });
 
@@ -207,20 +239,24 @@ export function registerSlackEvents(
       const channel = typeof e.channel === "string" ? e.channel : e.channel?.id;
       if (deduper.seen(dedupeKey({ event_id: (body as { event_id?: string })?.event_id, channel, ts: e.event_ts })))
         return;
-      await forceDirectorySync(client);
+      await forceDirectorySync(client, channel);
     });
   }
 
   app.event("member_left_channel", async ({ event, body, client }: any) => {
-    const e = event as { channel?: string; event_ts?: string };
+    const e = event as { channel?: string; user?: string; event_ts?: string };
     if (
       deduper.seen(
         dedupeKey({ event_id: (body as { event_id?: string })?.event_id, channel: e.channel, ts: e.event_ts }),
       )
     )
       return;
-    if (!e.channel || !knownPublicChannels.has(e.channel)) await forceDirectorySync(client);
+    const principalId = e.user ? (await directory.classifyUserCached(client, e.user)).actor.externalId : undefined;
+    await forceDirectorySync(client, e.channel, principalId);
   });
+
+  app.event("assistant_thread_started", async () => {});
+  app.event("assistant_thread_context_changed", async () => {});
 
   app.event("reaction_added", async ({ event, body, client }: any) => {
     await handleReactionEvent(event as SlackReactionEvent, body as any, client, true);
