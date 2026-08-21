@@ -71,6 +71,10 @@ test("custom provider lifecycle: register, list, resolve, delete — admin only,
     assert.equal(putBody.status.hasKey, true);
     assert.equal(JSON.stringify(putBody).includes("sk-acme-secret"), false);
 
+    const surface = await fetch(`${srv.base}/v1/surface-config`);
+    assert.equal(surface.status, 200);
+    assert.equal(((await surface.json()) as { modelProviderConfigured?: boolean }).modelProviderConfigured, true);
+
     // The runtime registry serves the model immediately.
     assert.equal(String(resolveModel("acme-large")?.provider), "acme-gateway");
 
@@ -92,6 +96,12 @@ test("custom provider lifecycle: register, list, resolve, delete — admin only,
     });
     assert.equal(del.status, 200);
     assert.equal(resolveModel("acme-large"), undefined);
+
+    const unconfiguredSurface = await fetch(`${srv.base}/v1/surface-config`);
+    assert.equal(
+      ((await unconfiguredSurface.json()) as { modelProviderConfigured?: boolean }).modelProviderConfigured,
+      false,
+    );
   } finally {
     await srv.close();
   }

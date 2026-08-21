@@ -1061,7 +1061,10 @@ async function getSurfaceConfig(ctx: ApiCtx): Promise<void> {
     resolveBranding(deps.config, orgScope(deps), deps.brandingDefault),
   ]);
   const harnessId = deps.harnessId ?? "pi";
-  const managedKeys = deps.modelCredentials ? await deps.modelCredentials.availability() : null;
+  const [managedKeys, customProviderStatuses] = await Promise.all([
+    deps.modelCredentials ? deps.modelCredentials.availability() : null,
+    deps.customProviders ? deps.customProviders.statuses() : null,
+  ]);
   const catalog = managedKeys?.openrouter
     ? await selectableModelCatalog(deps.modelCredentialFetch)
     : builtInModelCatalog();
@@ -1075,11 +1078,14 @@ async function getSurfaceConfig(ctx: ApiCtx): Promise<void> {
     ...(branding.mark ? { mark: branding.mark } : {}),
     ...(branding.selfLabel ? { selfLabel: branding.selfLabel } : {}),
   };
+  const modelProviderConfigured =
+    (managedKeys ? Object.values(managedKeys).some(Boolean) : false) ||
+    (customProviderStatuses?.some((provider) => !provider.disabled && provider.hasKey) ?? false);
   return sendJson(res, 200, {
     webuiModels: configuredPicker.length ? configuredPicker : allowed,
     baseModel: resolvedBase,
     harnessId,
-    ...(managedKeys ? { modelProviderConfigured: Object.values(managedKeys).some(Boolean) } : {}),
+    ...(managedKeys || customProviderStatuses ? { modelProviderConfigured } : {}),
     externalSlackParticipants,
     ...(Object.keys(resolvedBranding).length ? { branding: resolvedBranding } : {}),
   });

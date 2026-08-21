@@ -113,6 +113,7 @@ export async function assembleEnv(opts: {
     }
   }
   const wtEnv = readEnvFile(join(opts.worktree, ".env"));
+  if (!env.HARNESS && wtEnv.HARNESS) env.HARNESS = wtEnv.HARNESS;
   if (!env.ANTHROPIC_API_KEY && wtEnv.ANTHROPIC_API_KEY) {
     env.ANTHROPIC_API_KEY = wtEnv.ANTHROPIC_API_KEY;
     anthropicKeySource = "the worktree .env";
@@ -126,16 +127,24 @@ export async function assembleEnv(opts: {
   }
 
   let harness: "pi" | "mock" | "opencode" | "codex" | "claude";
-  if (opts.callerEnv.HARNESS === "codex" || opts.callerEnv.HARNESS === "claude") {
-    harness = opts.callerEnv.HARNESS;
+  const requestedHarness = env.HARNESS?.trim();
+  if (requestedHarness === "codex" || requestedHarness === "claude") {
+    harness = requestedHarness;
     env.HARNESS = harness;
     if (harness === "codex" && !env.OPENAI_API_KEY) {
       throw new Error(
         "HARNESS=codex needs OPENAI_API_KEY (its CLI cannot do browser OAuth in a container) -- export it, or add it to the live env file or the worktree .env",
       );
     }
+  } else if (requestedHarness === "pi" || requestedHarness === "opencode") {
+    harness = requestedHarness;
+    env.HARNESS = harness;
+    if (harness === "pi" && !env.PI_CAPTURE_REQUESTS) env.PI_CAPTURE_REQUESTS = "1";
+    if (!env.ANTHROPIC_API_KEY) {
+      warnings.push(`${harness} has no environment model key and expects a durable or custom provider credential`);
+    }
   } else if (env.ANTHROPIC_API_KEY) {
-    harness = opts.callerEnv.HARNESS === "opencode" ? "opencode" : "pi";
+    harness = requestedHarness === "opencode" ? "opencode" : "pi";
     env.HARNESS = harness;
     if (harness === "pi" && !env.PI_CAPTURE_REQUESTS) env.PI_CAPTURE_REQUESTS = "1";
   } else if (opts.allowMock) {

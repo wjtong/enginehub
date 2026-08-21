@@ -276,6 +276,30 @@ test("env assembly precedence: caller > login shell > dev.env > worktree .env; h
   assert.equal(fromDotenv.anthropicKeySource, "the worktree .env");
 
   writeFileSync(join(worktree, ".env"), "");
+  const explicitPi = await assembleEnv({
+    worktree,
+    callerEnv: { HARNESS: "pi" },
+    allowMock: false,
+    log,
+    probeLoginShell: async () => "",
+  });
+  assert.equal(explicitPi.harness, "pi");
+  assert.equal(explicitPi.env.HARNESS, "pi");
+  assert.equal(explicitPi.env.PI_CAPTURE_REQUESTS, "1");
+  assert.match(explicitPi.warnings.join("\n"), /durable or custom provider credential/);
+
+  writeFileSync(join(worktree, ".env"), "HARNESS=pi\n");
+  const persistedPi = await assembleEnv({
+    worktree,
+    callerEnv: {},
+    allowMock: false,
+    log,
+    probeLoginShell: async () => "",
+  });
+  assert.equal(persistedPi.harness, "pi");
+  assert.equal(persistedPi.env.HARNESS, "pi");
+  writeFileSync(join(worktree, ".env"), "");
+
   await assert.rejects(
     assembleEnv({ worktree, callerEnv: {}, allowMock: false, log, probeLoginShell: async () => "" }),
     /ANTHROPIC_API_KEY is required/,
